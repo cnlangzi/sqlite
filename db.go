@@ -11,8 +11,10 @@ import (
 
 var ErrTxNotready = errors.New("sqlite: transaction not ready")
 
-// DB wraps SQLite database with read/write separation.
-// Writer uses BatchWriter for buffered batch writes, Reader for reads.
+// DB wraps a SQLite database with logical read/write separation.
+// All writes go through the buffered Writer; all reads go directly to the Reader.
+// This separation allows concurrent reads while writes are being buffered and
+// committed by the background flush goroutine.
 type DB struct {
 	Writer *Writer
 	Reader *sql.DB
@@ -20,12 +22,15 @@ type DB struct {
 }
 
 // isInMemory reports whether the given DSN refers to an in-memory database.
+// Returns true for DSNs starting with ":memory:".
 func isInMemory(dsn string) bool {
 	return strings.HasPrefix(dsn, ":memory:")
 }
 
-// New creates a SQLite DB from a DSN, automatically detecting in-memory or file mode.
-// Use ":memory:" for an in-memory database, or a file path for a persistent database.
+// New opens a SQLite database from the given DSN. If DSN is empty, it
+// defaults to ":memory:" (an in-memory database). For file paths, the file
+// is created if it does not exist. This is an alias for Open; prefer Open
+// for clarity in application code.
 func New(ctx context.Context, dsn string) (*DB, error) {
 	if dsn == "" {
 		dsn = ":memory:"
@@ -38,12 +43,16 @@ func New(ctx context.Context, dsn string) (*DB, error) {
 	return openFile(ctx, dsn)
 }
 
-// Open is an alias for New.
+// Open opens a SQLite database from the given DSN. If DSN is empty, it
+// defaults to ":memory:" (an in-memory database). For file paths, the file
+// is created if it does not exist. This is the preferred constructor.
 func Open(ctx context.Context, dsn string) (*DB, error) {
 	return New(ctx, dsn)
 }
 
-// Close closes both Writer and Reader connections.
+// Close shuts down the writer flush goroutine (committing any pending writes)
+// and closes both the Writer and Reader database connections. Always call
+// Close when you are done with the DB to avoid leaking goroutines or connections.
 func (db *DB) Close() error {
 	var errs []error
 
@@ -61,32 +70,41 @@ func (db *DB) Close() error {
 	return nil
 }
 
-// Exec executes a write operation on Writer.
+// Exec delegates to Writer.Exec, executing a write statement (INSERT,
+// UPDATE, DELETE, CREATE TABLE, etc.) asynchronously with buffering.
+// See Writer.Exec for details on buffering behavior.
 func (db *DB) Exec(query string, args ...interface{}) (sql.Result, error) {
 	return db.Writer.Exec(query, args...)
 }
 
-// ExecContext executes a write operation on Writer with context.
+// ExecContext delegates to Writer.ExecContext, executing a write statement
+// with context cancellation support. See Writer.ExecContext for details.
 func (db *DB) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
 	return db.Writer.ExecContext(ctx, query, args...)
 }
 
-// Query executes a read operation on Reader.
+// Query delegates to Reader.Query, executing a read-only query on the
+// dedicated reader connection pool. Returns *sql.Rows that must be closed.
+// Reads are served concurrently with writes and do not block the Writer.
 func (db *DB) Query(query string, args ...interface{}) (*sql.Rows, error) {
 	return db.Reader.Query(query, args...)
 }
 
-// QueryContext executes a read operation on Reader with context.
+// QueryContext delegates to Reader.QueryContext, executing a read-only query
+// with context cancellation support. Returns *sql.Rows that must be closed.
 func (db *DB) QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
 	return db.Reader.QueryContext(ctx, query, args...)
 }
 
-// QueryRow executes a read operation on Reader and returns a single row.
+// QueryRow delegates to Reader.QueryRow, executing a read-only query that
+// returns at most one row. This is more efficient than Query when you only
+// need a single row. Returns *sql.Row (not an error) even if no row is found.
 func (db *DB) QueryRow(query string, args ...interface{}) *sql.Row {
 	return db.Reader.QueryRow(query, args...)
 }
 
-// QueryRowContext executes a read operation on Reader with context and returns a single row.
+// QueryRowContext delegates to Reader.QueryRowContext, executing a read-only
+// query with context cancellation support and returning at most one row.
 func (db *DB) QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row {
 	return db.Reader.QueryRowContext(ctx, query, args...)
 }

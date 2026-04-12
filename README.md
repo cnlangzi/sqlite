@@ -168,14 +168,3 @@ sp.Release() // or sp.Rollback() to undo
 - **Memory**: In-memory mode shares a single connection; file mode uses separate reader/writer connections
 - **Durability**: Writes are committed to WAL on flush interval; call `Commit()` for immediate persistence
 
-## SQLite Compilation Notes
-
-This package uses [mattn/go-sqlite3](https://github.com/mattn/go-sqlite3) and requires CGO. Ensure you have a C compiler installed:
-
-```bash
-# macOS
-xcode-select --install
-
-# Ubuntu/Debian
-sudo apt-get install build-essential
-```
