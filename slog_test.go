@@ -35,14 +35,13 @@ type testHandler struct {
 func (h *testHandler) Handle(_ context.Context, r slog.Record) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	entry := slogEntry{Level: r.Level.String()}
+	entry := slogEntry{
+		Level:  r.Level.String(),
+		Msg:    r.Message,
+	}
 
 	r.Attrs(func(a slog.Attr) bool {
 		switch a.Key {
-		case "msg":
-			if v, ok := a.Value.Any().(string); ok {
-				entry.Msg = v
-			}
 		case "buffer":
 			if v, ok := a.Value.Any().(int); ok {
 				entry.Buffer = v
@@ -60,8 +59,8 @@ func (h *testHandler) Handle(_ context.Context, r slog.Record) error {
 				entry.Count = v
 			}
 		case "elapsed":
-			if v, ok := a.Value.Any().(time.Duration); ok {
-				entry.Elapsed = v.String()
+			if v, ok := a.Value.Any().(int64); ok {
+				entry.Elapsed = time.Duration(v).String()
 			}
 		case "err":
 			if v, ok := a.Value.Any().(string); ok {
@@ -101,7 +100,8 @@ func findEntry(h *testHandler, msg string) *slogEntry {
 	defer h.mu.Unlock()
 	for i := range h.entries {
 		if h.entries[i].Msg == msg {
-			return &h.entries[i]
+			e := h.entries[i]
+			return &e
 		}
 	}
 	return nil
