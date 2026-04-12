@@ -207,3 +207,40 @@ The package uses `log/slog` for structured logging at key points in the writer/b
 - **Memory**: In-memory mode shares a single connection; file mode uses separate reader/writer connections
 - **Durability**: Writes are committed to WAL on flush interval; call `Commit()` for immediate persistence
 
+## Development
+
+### Makefile Targets
+
+This project uses a Makefile for common development tasks:
+
+```bash
+# Run all tests with race detection
+make test
+
+# Run the linter
+make lint
+
+# Install the pre-commit hook (runs test + lint before each commit)
+make hooks-install
+```
+
+### Pre-commit Hook
+
+After cloning the repository, install the pre-commit hook to automatically run tests and linting before each commit:
+
+```bash
+make hooks-install
+```
+
+The hook blocks commits if `make test` or `make lint` fail, ensuring the codebase stays clean and tests pass.
+
+### CI
+
+Pull requests to `main` trigger a GitHub Actions workflow that runs:
+1. `go vet` — static analysis
+2. `go build` — verify compilation
+3. `make test` — run tests with race detection
+4. `make lint` — run golangci-lint
+
+The workflow must pass before a PR can be merged.
+
