@@ -26,7 +26,7 @@ func NewSavepoint(tx *sql.Tx) (*Savepoint, error) {
 		return nil, err
 	}
 
-	return &Savepoint{tx: tx, name: name}, nil
+	return &Savepoint{tx: tx, name: name, ok: true}, nil
 }
 
 func (s *Savepoint) Rollback() {

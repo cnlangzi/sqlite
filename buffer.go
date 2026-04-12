@@ -4,11 +4,11 @@ import (
 	"time"
 )
 
-// Buffer holds batch writer configuration.
-type Buffer struct {
-	// BufferSize is the number of statements to buffer before flushing.
+// BufferConfig holds batch writer configuration.
+type BufferConfig struct {
+	// Size is the number of statements to buffer before flushing.
 	// Default: 100
-	BufferSize int
+	Size int
 
 	// FlushInterval is the maximum time to wait before flushing.
 	// Default: 100ms
@@ -16,9 +16,9 @@ type Buffer struct {
 }
 
 // Validate sets defaults and validates the configuration.
-func (c *Buffer) Validate() {
-	if c.BufferSize <= 0 {
-		c.BufferSize = 100
+func (c *BufferConfig) Validate() {
+	if c.Size <= 0 {
+		c.Size = 100
 	}
 
 	if c.FlushInterval <= 0 {

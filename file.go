@@ -38,7 +38,7 @@ func openFile(ctx context.Context, dsn string) (*DB, error) {
 	}
 
 	return &DB{
-		Writer: NewWriter(writerDB, Buffer{BufferSize: 100, FlushInterval: 100 * time.Millisecond}),
+		Writer: NewWriter(writerDB, BufferConfig{Size: 100, FlushInterval: 100 * time.Millisecond}),
 		Reader: readerDB,
 		ctx:    ctx,
 	}, nil

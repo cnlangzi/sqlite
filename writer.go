@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,12 +16,13 @@ var ErrClosed = errors.New("sqlite: writer is closed")
 // All writes are serialized through a single goroutine via cmdCh.
 type Writer struct {
 	*sql.DB
-	cfg Buffer
+	cfg BufferConfig
 
-	tasks chan TaskFunc
-	close chan struct{}
-	done  chan struct{} // closed when flush goroutine exits; broadcast to all do() callers
-	once  sync.Once
+	tasks  chan TaskFunc
+	close  chan struct{}
+	done   chan struct{} // closed when flush goroutine exits; broadcast to all do() callers
+	once   sync.Once
+	closed atomic.Bool // set to true before done is closed; fast-path guard in do()
 
 	tx *sql.Tx
 
@@ -29,7 +31,7 @@ type Writer struct {
 }
 
 // NewWriter creates a Writer wrapping the provided *sql.DB.
-func NewWriter(db *sql.DB, cfg Buffer) *Writer {
+func NewWriter(db *sql.DB, cfg BufferConfig) *Writer {
 	cfg.Validate()
 	w := &Writer{
 		DB:     db,
@@ -56,6 +58,7 @@ func (w *Writer) flush() {
 
 		timer.Stop()
 
+		w.closed.Store(true)
 		close(w.done)
 	}()
 
@@ -91,7 +94,7 @@ func (w *Writer) flush() {
 			w.buffer++
 			// Check size threshold
 
-			if task.Flush() || w.buffer >= w.cfg.BufferSize {
+			if task.Flush() || w.buffer >= w.cfg.Size {
 				if err := w.Commit(); err != nil {
 					slog.Error("sqlite: commit", slog.String("err", err.Error()))
 				}
@@ -126,6 +129,9 @@ func (w *Writer) Commit() error {
 }
 
 func (w *Writer) do(task TaskFunc) (chan TaskResult, error) {
+	if w.closed.Load() {
+		return nil, ErrClosed
+	}
 	select {
 	case w.tasks <- task:
 		return task.Notify(), nil

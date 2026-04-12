@@ -15,7 +15,7 @@ func openMemory(ctx context.Context, dsn string) (*DB, error) {
 	}
 
 	return &DB{
-		Writer: NewWriter(db, Buffer{BufferSize: 100, FlushInterval: 100 * time.Millisecond}),
+		Writer: NewWriter(db, BufferConfig{Size: 100, FlushInterval: 100 * time.Millisecond}),
 		Reader: db,
 		ctx:    ctx,
 	}, nil
