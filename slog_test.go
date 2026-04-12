@@ -43,20 +43,20 @@ func (h *testHandler) Handle(_ context.Context, r slog.Record) error {
 	r.Attrs(func(a slog.Attr) bool {
 		switch a.Key {
 		case "buffer":
-			if v, ok := a.Value.Any().(int); ok {
-				entry.Buffer = v
+			if v, ok := a.Value.Any().(int64); ok {
+				entry.Buffer = int(v)
 			}
 		case "size_limit":
-			if v, ok := a.Value.Any().(int); ok {
-				entry.SizeLimit = v
+			if v, ok := a.Value.Any().(int64); ok {
+				entry.SizeLimit = int(v)
 			}
 		case "trigger":
 			if v, ok := a.Value.Any().(string); ok {
 				entry.Trigger = v
 			}
 		case "count":
-			if v, ok := a.Value.Any().(int); ok {
-				entry.Count = v
+			if v, ok := a.Value.Any().(int64); ok {
+				entry.Count = int(v)
 			}
 		case "elapsed":
 			if v, ok := a.Value.Any().(int64); ok {
@@ -67,8 +67,8 @@ func (h *testHandler) Handle(_ context.Context, r slog.Record) error {
 				entry.Err = v
 			}
 		case "remaining_buffer":
-			if v, ok := a.Value.Any().(int); ok {
-				entry.RemainingBuffer = v
+			if v, ok := a.Value.Any().(int64); ok {
+				entry.RemainingBuffer = int(v)
 			}
 		}
 		return true
