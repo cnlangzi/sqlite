@@ -3,6 +3,7 @@ package sqlite
 import (
 	"database/sql"
 	"errors"
+	"log/slog"
 )
 
 // Tx is a buffered transaction that batches multiple write statements
@@ -44,6 +45,11 @@ func (btx *Tx) Commit() error {
 	}
 
 	result := <-task
+	if result.Error == nil {
+		slog.Debug("tx committed", slog.Int("count", len(btx.buf)))
+	} else {
+		slog.Debug("tx rolled back", slog.Int("count", len(btx.buf)))
+	}
 
 	return result.Error
 
@@ -58,7 +64,10 @@ func (btx *Tx) Rollback() error {
 		return nil
 	}
 	btx.done = true
+	count := len(btx.buf)
 	btx.buf = nil
+
+	slog.Debug("tx rolled back", slog.Int("count", count))
 
 	return nil
 }

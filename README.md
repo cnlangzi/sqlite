@@ -161,6 +161,45 @@ if err != nil {
 sp.Release() // or sp.Rollback() to undo
 ```
 
+## Structured Logging
+
+The package uses `log/slog` for structured logging at key points in the writer/buffer pipeline. Configure the slog level and handler as needed.
+
+### Log Schema
+
+| Level | Message | Fields | Description |
+|-------|---------|--------|-------------|
+| Debug | `task received` | `buffer` | Task received by flush goroutine |
+| Debug | `buffered` | `buffer`, `size_limit` | Statement added to buffer |
+| Debug | `tx started` | `buffer` | New transaction begun |
+| Debug | `commit triggered` | `trigger`, `buffer` | Commit initiated (trigger: size/interval/manual/close) |
+| Info | `committed` | `trigger`, `count`, `elapsed` | Successful commit with duration |
+| Error | `commit failed` | `trigger`, `buffer`, `err` | Commit failure |
+| Debug | `flush requested` | `buffer` | Manual Flush() called |
+| Warn | `task blocked` | `buffer` | Channel full, task rejected |
+| Info | `close signal received` | - | Close signal received |
+| Info | `drained on close` | `remaining_buffer` | Final commit on close |
+| Debug | `tx committed` | `count` | Buffered Tx committed successfully |
+| Debug | `tx rolled back` | `count` | Buffered Tx rolled back |
+
+### Example Log Output
+
+```json
+{"time":"2024-01-15T10:30:00Z","level":"DEBUG","msg":"task received","buffer":5}
+{"time":"2024-01-15T10:30:00Z","level":"DEBUG","msg":"buffered","buffer":6,"size_limit":100}
+{"time":"2024-01-15T10:30:01Z","level":"DEBUG","msg":"commit triggered","trigger":"size","buffer":100}
+{"time":"2024-01-15T10:30:01Z","level":"INFO","msg":"committed","trigger":"size","count":100,"elapsed":"1.234ms"}
+{"time":"2024-01-15T10:30:05Z","level":"INFO","msg":"close signal received"}
+{"time":"2024-01-15T10:30:05Z","level":"INFO","msg":"drained on close","remaining_buffer":0}
+```
+
+### Log Levels
+
+- **Debug**: Routine flow (task received, buffered, tx started, commit triggered, flush requested, tx committed/rolled back)
+- **Info**: Meaningful business events (committed, close signal received, drained on close)
+- **Warn**: Backpressure (task blocked)
+- **Error**: Failures (commit failed)
+
 ## Performance Characteristics
 
 - **Writes**: Serialized through a single goroutine; batching reduces transaction overhead

@@ -12,6 +12,16 @@ import (
 
 var ErrClosed = errors.New("sqlite: writer is closed")
 
+// commitTrigger indicates what caused a commit.
+type commitTrigger string
+
+const (
+	triggerSize     commitTrigger = "size"
+	triggerInterval commitTrigger = "interval"
+	triggerManual   commitTrigger = "manual"
+	triggerClose    commitTrigger = "close"
+)
+
 // BufferWriter provides transparent batch writing with channel-based coordination.
 // All writes are serialized through a single goroutine via cmdCh.
 type BufferWriter struct {
@@ -56,9 +66,12 @@ func (w *BufferWriter) waitSingal() {
 	timer := time.NewTicker(w.cfg.FlushInterval)
 	defer func() {
 		if w.buffer > 0 && w.tx != nil {
-			err := w.commit()
+			err := w.commitWithTrigger(triggerClose)
 			if err != nil {
-				slog.Error("sqlite: commit", slog.String("err", err.Error()))
+				slog.Error("commit failed",
+					slog.String("trigger", string(triggerClose)),
+					slog.Int("buffer", w.buffer),
+					slog.String("err", err.Error()))
 			}
 		}
 
@@ -71,6 +84,7 @@ func (w *BufferWriter) waitSingal() {
 	for {
 		select {
 		case <-w.close:
+			slog.Info("close signal received")
 			// Drain buffered tasks so their callers are not leaked.
 			for {
 				select {
@@ -82,11 +96,18 @@ func (w *BufferWriter) waitSingal() {
 			}
 		drained:
 			// Commit whatever was already buffered before the close signal.
-			if err := w.commit(); err != nil {
-				slog.Error("sqlite: commit on close", slog.String("err", err.Error()))
+			remaining := w.buffer
+			if err := w.commitWithTrigger(triggerClose); err != nil {
+				slog.Error("commit failed",
+					slog.String("trigger", string(triggerClose)),
+					slog.Int("buffer", remaining),
+					slog.String("err", err.Error()))
+			} else {
+				slog.Info("drained on close", slog.Int("remaining_buffer", remaining))
 			}
 			return // defer handles close(w.done)
 		case task := <-w.tasks:
+			slog.Debug("task received", slog.Int("buffer", w.buffer))
 
 			if w.tx == nil {
 				var err error
@@ -95,14 +116,19 @@ func (w *BufferWriter) waitSingal() {
 					task.Notify() <- TaskResult{Error: err}
 					continue
 				}
+				slog.Debug("tx started", slog.Int("buffer", w.buffer))
 			}
 			result := task.Exec(w.tx)
 			w.buffer++
-			// Check size threshold
+			slog.Debug("buffered", slog.Int("buffer", w.buffer), slog.Int("size_limit", w.cfg.Size))
 
 			if task.Flush() || w.buffer >= w.cfg.Size {
-				if err := w.commit(); err != nil {
-					slog.Error("sqlite: commit", slog.String("err", err.Error()))
+				slog.Debug("commit triggered", slog.String("trigger", string(triggerSize)), slog.Int("buffer", w.buffer))
+				if err := w.commitWithTrigger(triggerSize); err != nil {
+					slog.Error("commit failed",
+						slog.String("trigger", string(triggerSize)),
+						slog.Int("buffer", w.buffer),
+						slog.String("err", err.Error()))
 				}
 			}
 
@@ -110,8 +136,12 @@ func (w *BufferWriter) waitSingal() {
 
 		case <-timer.C:
 			if w.buffer > 0 && time.Since(w.lastCommit) >= w.cfg.FlushInterval {
-				if err := w.commit(); err != nil {
-					slog.Error("sqlite: commit", slog.String("err", err.Error()))
+				slog.Debug("commit triggered", slog.String("trigger", string(triggerInterval)), slog.Int("buffer", w.buffer))
+				if err := w.commitWithTrigger(triggerInterval); err != nil {
+					slog.Error("commit failed",
+						slog.String("trigger", string(triggerInterval)),
+						slog.Int("buffer", w.buffer),
+						slog.String("err", err.Error()))
 				}
 			}
 
@@ -120,6 +150,7 @@ func (w *BufferWriter) waitSingal() {
 }
 
 func (w *BufferWriter) Flush() error {
+	slog.Debug("flush requested", slog.Int("buffer", w.buffer))
 
 	task, err := w.do(Commit())
 
@@ -136,15 +167,33 @@ func (w *BufferWriter) Flush() error {
 // transaction. If there is no pending work, it is a no-op. After a successful
 // commit, a new lazy transaction is started for subsequent writes.
 func (w *BufferWriter) commit() error {
+	return w.commitWithTrigger(triggerManual)
+}
+
+// commitWithTrigger commits the current transaction and logs with the given trigger.
+func (w *BufferWriter) commitWithTrigger(trigger commitTrigger) error {
 	if w.tx == nil || w.buffer < 1 {
 		return nil
 	}
 
+	start := time.Now()
 	err := w.tx.Commit()
+	elapsed := time.Since(start)
+	count := w.buffer
+
 	if err == nil {
 		w.buffer = 0
 		w.tx = nil // next tx is created lazily on the next incoming task
 		w.lastCommit = time.Now()
+		slog.Info("committed",
+			slog.String("trigger", string(trigger)),
+			slog.Int("count", count),
+			slog.Duration("elapsed", elapsed))
+	} else {
+		slog.Error("commit failed",
+			slog.String("trigger", string(trigger)),
+			slog.Int("buffer", w.buffer),
+			slog.String("err", err.Error()))
 	}
 
 	return err
@@ -160,6 +209,9 @@ func (w *BufferWriter) do(task TaskFunc) (chan TaskResult, error) {
 	case w.tasks <- task:
 		return task.Notify(), nil
 	case <-w.done:
+		return nil, ErrClosed
+	default:
+		slog.Warn("task blocked", slog.Int("buffer", w.buffer))
 		return nil, ErrClosed
 	}
 }
