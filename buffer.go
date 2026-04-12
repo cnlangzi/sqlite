@@ -21,29 +21,30 @@ type BufferConfig struct {
 	FlushInterval time.Duration
 }
 
+// DefaultBufferConfig returns a BufferConfig with defaults applied,
+// reading from SQLITE_BUFFER_SIZE and SQLITE_BUFFER_FLUSH_INTERVAL env vars
+// when set. Call this at Open time to respect environment configuration.
+func DefaultBufferConfig() BufferConfig {
+	cfg := BufferConfig{Size: 100, FlushInterval: 100 * time.Millisecond}
+	if v := os.Getenv("SQLITE_BUFFER_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.Size = n
+		}
+	}
+	if v := os.Getenv("SQLITE_BUFFER_FLUSH_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			cfg.FlushInterval = d
+		}
+	}
+	return cfg
+}
+
 // Validate sets default values for any zero fields and ensures the
-// configuration is usable. Environment variables are consulted when a field
-// is zero: SQLITE_BUFFER_SIZE and SQLITE_BUFFER_FLUSH_INTERVAL.
-// It is called automatically by NewWriter; you only need to invoke it if
-// you wish to check a config before use.
+// configuration is usable. It is called automatically by NewWriter;
+// you only need to invoke it if you wish to check a config before use.
 func (c *BufferConfig) Validate() {
 	if c.Size <= 0 {
-		if v := os.Getenv("SQLITE_BUFFER_SIZE"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				c.Size = n
-			}
-		}
-	}
-	if c.Size <= 0 {
 		c.Size = 100
-	}
-
-	if c.FlushInterval <= 0 {
-		if v := os.Getenv("SQLITE_BUFFER_FLUSH_INTERVAL"); v != "" {
-			if d, err := time.ParseDuration(v); err == nil && d > 0 {
-				c.FlushInterval = d
-			}
-		}
 	}
 	if c.FlushInterval <= 0 {
 		c.FlushInterval = 500 * time.Millisecond
