@@ -47,6 +47,6 @@ func (c *BufferConfig) Validate() {
 		c.Size = 100
 	}
 	if c.FlushInterval <= 0 {
-		c.FlushInterval = 500 * time.Millisecond
+		c.FlushInterval = 100 * time.Millisecond
 	}
 }
