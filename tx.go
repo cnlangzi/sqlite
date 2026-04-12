@@ -10,7 +10,7 @@ import (
 // transaction, Tx does not hold a lock on the database; statements are
 // buffered locally and submitted to the Writer's shared transaction on Commit.
 type Tx struct {
-	w *Writer
+	w *BufferWriter
 
 	buf  []TaskArgs // buffered statements to execute on commit
 	done bool       // true after Commit or Rollback has been called
@@ -37,7 +37,7 @@ func (btx *Tx) Commit() error {
 	}
 
 	btx.done = true
-	task, err := btx.w.do(Commit(btx.buf))
+	task, err := btx.w.do(Commit(btx.buf...))
 
 	if err != nil {
 		return err

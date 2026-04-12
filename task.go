@@ -99,7 +99,7 @@ func Exec(query string, args ...any) TaskFunc {
 // Commit creates a TaskFunc that commits the current transaction.
 // It also sets Flush() to true, ensuring any pending buffered writes
 // are flushed before this task is processed.
-func Commit(tasks []TaskArgs) TaskFunc {
+func Commit(tasks ...TaskArgs) TaskFunc {
 	return &Task{
 		flush:  true,
 		notify: make(chan TaskResult, 1),

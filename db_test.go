@@ -51,7 +51,7 @@ func TestOpen_File(t *testing.T) {
 	}
 
 	// flush immediately to ensure data is written to disk
-	db.Writer.Commit()
+	db.Writer.Flush()
 
 	// Test read after write
 	rows, err := db.Reader.Query("SELECT name FROM sqlite_master WHERE type='table'")

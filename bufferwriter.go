@@ -12,9 +12,9 @@ import (
 
 var ErrClosed = errors.New("sqlite: writer is closed")
 
-// Writer provides transparent batch writing with channel-based coordination.
+// BufferWriter provides transparent batch writing with channel-based coordination.
 // All writes are serialized through a single goroutine via cmdCh.
-type Writer struct {
+type BufferWriter struct {
 	*sql.DB
 	cfg BufferConfig
 
@@ -33,9 +33,9 @@ type Writer struct {
 // NewWriter creates a Writer wrapping the provided *sql.DB.
 // The returned Writer starts a background flush goroutine immediately.
 // Close must be called to shut it down cleanly.
-func NewWriter(db *sql.DB, cfg BufferConfig) *Writer {
+func NewWriter(db *sql.DB, cfg BufferConfig) *BufferWriter {
 	cfg.Validate()
-	w := &Writer{
+	w := &BufferWriter{
 		DB:     db,
 		cfg:    cfg,
 		tasks:  make(chan TaskFunc, 100),
@@ -43,20 +43,20 @@ func NewWriter(db *sql.DB, cfg BufferConfig) *Writer {
 		done:   make(chan struct{}),
 		buffer: 0,
 	}
-	go w.flush()
+	go w.waitSingal()
 
 	return w
 }
 
-// flush is the writer's background goroutine. It receives tasks from the
+// waitSingal is the writer's background goroutine. It receives tasks from the
 // tasks channel, accumulates them in a transaction, and commits based on
 // buffer size or elapsed time. It exits when close is signaled, committing
 // any remaining buffered work before terminating.
-func (w *Writer) flush() {
+func (w *BufferWriter) waitSingal() {
 	timer := time.NewTicker(w.cfg.FlushInterval)
 	defer func() {
 		if w.buffer > 0 && w.tx != nil {
-			err := w.Commit()
+			err := w.commit()
 			if err != nil {
 				slog.Error("sqlite: commit", slog.String("err", err.Error()))
 			}
@@ -82,7 +82,7 @@ func (w *Writer) flush() {
 			}
 		drained:
 			// Commit whatever was already buffered before the close signal.
-			if err := w.Commit(); err != nil {
+			if err := w.commit(); err != nil {
 				slog.Error("sqlite: commit on close", slog.String("err", err.Error()))
 			}
 			return // defer handles close(w.done)
@@ -101,7 +101,7 @@ func (w *Writer) flush() {
 			// Check size threshold
 
 			if task.Flush() || w.buffer >= w.cfg.Size {
-				if err := w.Commit(); err != nil {
+				if err := w.commit(); err != nil {
 					slog.Error("sqlite: commit", slog.String("err", err.Error()))
 				}
 			}
@@ -110,7 +110,7 @@ func (w *Writer) flush() {
 
 		case <-timer.C:
 			if w.buffer > 0 && time.Since(w.lastCommit) >= w.cfg.FlushInterval {
-				if err := w.Commit(); err != nil {
+				if err := w.commit(); err != nil {
 					slog.Error("sqlite: commit", slog.String("err", err.Error()))
 				}
 			}
@@ -119,10 +119,23 @@ func (w *Writer) flush() {
 	}
 }
 
-// Commit flushes any pending buffered statements by committing the current
+func (w *BufferWriter) Flush() error {
+
+	task, err := w.do(Commit())
+
+	if err != nil {
+		return err
+	}
+
+	result := <-task
+
+	return result.Error
+}
+
+// commit flushes any pending buffered statements by committing the current
 // transaction. If there is no pending work, it is a no-op. After a successful
 // commit, a new lazy transaction is started for subsequent writes.
-func (w *Writer) Commit() error {
+func (w *BufferWriter) commit() error {
 	if w.tx == nil || w.buffer < 1 {
 		return nil
 	}
@@ -139,7 +152,7 @@ func (w *Writer) Commit() error {
 
 // do submits a task to the flush goroutine and returns a channel that
 // receives the result. If the writer is already closed, it returns ErrClosed.
-func (w *Writer) do(task TaskFunc) (chan TaskResult, error) {
+func (w *BufferWriter) do(task TaskFunc) (chan TaskResult, error) {
 	if w.closed.Load() {
 		return nil, ErrClosed
 	}
@@ -155,7 +168,7 @@ func (w *Writer) do(task TaskFunc) (chan TaskResult, error) {
 // asynchronously. The statement is buffered and flushed according to the
 // BufferConfig settings. If the context is cancelled before the statement
 // is processed, ctx.Err() is returned.
-func (w *Writer) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+func (w *BufferWriter) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -182,7 +195,7 @@ func (w *Writer) ExecContext(ctx context.Context, query string, args ...any) (sq
 // asynchronously. The statement is buffered and flushed according to the
 // BufferConfig settings. This is the non-context variant; use ExecContext
 // if you need cancellation or deadline control.
-func (w *Writer) Exec(query string, args ...any) (sql.Result, error) {
+func (w *BufferWriter) Exec(query string, args ...any) (sql.Result, error) {
 	ch, err := w.do(Exec(query, args...))
 	if err != nil {
 		return nil, err
@@ -199,7 +212,7 @@ func (w *Writer) Exec(query string, args ...any) (sql.Result, error) {
 // only committed when Tx.Commit is called. The opts parameter is accepted
 // for compatibility with database/sql but is not used (savepoints handle
 // the transactional semantics internally).
-func (w *Writer) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
+func (w *BufferWriter) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
 	return &Tx{w: w}, nil
 }
 
@@ -207,7 +220,7 @@ func (w *Writer) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) 
 // commit any remaining buffered work, then marks the writer as closed.
 // It is safe to call Close multiple times concurrently; subsequent calls
 // return nil immediately.
-func (w *Writer) Close() error {
+func (w *BufferWriter) Close() error {
 	w.once.Do(func() {
 		w.close <- struct{}{}
 		<-w.done // wait for flush to commit and exit

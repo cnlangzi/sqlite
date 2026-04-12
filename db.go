@@ -16,7 +16,7 @@ var ErrTxNotready = errors.New("sqlite: transaction not ready")
 // This separation allows concurrent reads while writes are being buffered and
 // committed by the background flush goroutine.
 type DB struct {
-	Writer *Writer
+	Writer *BufferWriter
 	Reader *sql.DB
 	ctx    context.Context
 }
@@ -48,6 +48,10 @@ func New(ctx context.Context, dsn string) (*DB, error) {
 // is created if it does not exist. This is the preferred constructor.
 func Open(ctx context.Context, dsn string) (*DB, error) {
 	return New(ctx, dsn)
+}
+
+func (db *DB) Flush() error {
+	return db.Writer.Flush()
 }
 
 // Close shuts down the writer flush goroutine (committing any pending writes)

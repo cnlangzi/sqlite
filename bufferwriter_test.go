@@ -112,7 +112,7 @@ func TestWriter_BeginTx_Rollback(t *testing.T) {
 	// Insert one row first
 	_, err := bw.Exec("INSERT INTO users (id, name) VALUES (1, 'existing')")
 	require.NoError(t, err)
-	bw.Commit()
+	bw.Flush()
 
 	// BeginTx and add rows
 	tx, err := bw.BeginTx(context.Background(), nil)
@@ -166,44 +166,6 @@ func TestWriter_DirectExec_TimeBased(t *testing.T) {
 	})
 }
 
-func TestWriter_TimeBasedBlockedByActiveBatchTx(t *testing.T) {
-	t.SkipNow()
-	db, cleanup := newTestDB(t)
-	defer cleanup()
-
-	bw := NewWriter(db, BufferConfig{
-		Size:          2,
-		FlushInterval: 100 * time.Millisecond,
-	})
-	defer bw.Close()
-
-	// BeginTx - holds lock
-	tx, err := bw.BeginTx(context.Background(), nil)
-	require.NoError(t, err)
-	btx := tx
-
-	// Insert rows into BatchTx
-	_, err = btx.Exec("INSERT INTO users (id, name) VALUES (1, 'alice')")
-	assert.NoError(t, err)
-
-	// Time-based should not flush (blocked by active BatchTx)
-	time.Sleep(50 * time.Millisecond)
-	assert.Equal(t, 1, bw.buffer) // pending but not flushed
-
-	// Commit should release lock and trigger flush
-	err = btx.Commit()
-	assert.NoError(t, err)
-
-	// Buffer should be empty now
-	assert.Equal(t, 0, bw.buffer)
-
-	// Data should be committed
-	var count int
-	err = bw.QueryRow("SELECT COUNT(*) FROM users").Scan(&count)
-	assert.NoError(t, err)
-	assert.Equal(t, 1, count)
-}
-
 func TestWriter_DirectExec_Concurrent(t *testing.T) {
 	db, cleanup := newTestDB(t)
 	defer cleanup()
@@ -232,7 +194,7 @@ func TestWriter_DirectExec_Concurrent(t *testing.T) {
 	wg.Wait()
 
 	// Flush remaining
-	bw.Commit()
+	bw.Flush()
 
 	var count int
 	err := bw.QueryRow("SELECT COUNT(*) FROM users").Scan(&count)
@@ -264,7 +226,7 @@ func TestWriter_GlobalTxReusedAfterFlush(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Flush manually
-	err = bw.Commit()
+	err = bw.Flush()
 	assert.NoError(t, err)
 
 	// All 4 rows should exist
@@ -502,7 +464,7 @@ func TestWriter_Tx_SavepointRollbackOnError(t *testing.T) {
 	// Commit a row that will cause a PK conflict inside the Tx.
 	_, err := bw.Exec("INSERT INTO users (id, name) VALUES (1, 'existing')")
 	require.NoError(t, err)
-	require.NoError(t, bw.Commit())
+	require.NoError(t, bw.Flush())
 
 	tx, err := bw.BeginTx(context.Background(), nil)
 	require.NoError(t, err)
@@ -523,7 +485,7 @@ func TestWriter_Tx_SavepointRollbackOnError(t *testing.T) {
 	// Writer should still be usable after a failed Tx.
 	_, err = bw.Exec("INSERT INTO users (id, name) VALUES (3, 'after')")
 	assert.NoError(t, err)
-	require.NoError(t, bw.Commit())
+	require.NoError(t, bw.Flush())
 
 	err = db.QueryRow("SELECT COUNT(*) FROM users").Scan(&count)
 	require.NoError(t, err)
@@ -561,7 +523,7 @@ func TestWriter_ConcurrentBeginTxCommit(t *testing.T) {
 	}
 	wg.Wait()
 
-	require.NoError(t, bw.Commit())
+	require.NoError(t, bw.Flush())
 
 	var count int
 	err := db.QueryRow("SELECT COUNT(*) FROM users").Scan(&count)
