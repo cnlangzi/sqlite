@@ -2,9 +2,7 @@ package sqlite
 
 import (
 	"context"
-	"database/sql"
 	"log/slog"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -120,22 +118,6 @@ func countEntries(h *testHandler, msg string) int {
 		}
 	}
 	return n
-}
-
-func newTestDB(t *testing.T) (*sql.DB, func()) {
-	f, err := os.CreateTemp("", "slogtest-*.db")
-	require.NoError(t, err)
-	f.Close()
-
-	db, err := sql.Open("sqlite", f.Name()+"?_journal_mode=WAL&_synchronous=OFF")
-	require.NoError(t, err)
-	_, err = db.Exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
-	require.NoError(t, err)
-
-	return db, func() {
-		db.Close()
-		os.Remove(f.Name())
-	}
 }
 
 func TestSlog_SizeTriggeredFlush(t *testing.T) {
@@ -261,7 +243,7 @@ func TestSlog_CloseDrain(t *testing.T) {
 }
 
 func TestSlog_TaskBlocked(t *testing.T) {
-	h, cleanup := resetSlog(t)
+	_, cleanup := resetSlog(t)
 	defer cleanup()
 
 	db, dbCleanup := newTestDB(t)
@@ -280,7 +262,7 @@ func TestSlog_TaskBlocked(t *testing.T) {
 	defer bw.Close()
 
 	// First task should succeed
-	_, err := bw.Exec("INSERT INTO users (id, name) VALUES (1, 'a')")
+	_, _ = bw.Exec("INSERT INTO users (id, name) VALUES (1, 'a')")
 	// Might succeed or fail depending on timing
 
 	// Try to fill the channel
