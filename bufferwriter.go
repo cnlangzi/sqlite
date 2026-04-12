@@ -163,15 +163,6 @@ func (w *BufferWriter) Flush() error {
 	return result.Error
 }
 
-// commit flushes any pending buffered statements by committing the current
-// transaction. If there is no pending work, it is a no-op. After a successful
-// commit, a new lazy transaction is started for subsequent writes.
-//
-//nolint:unused
-func (w *BufferWriter) commit() error {
-	return w.commitWithTrigger(triggerManual)
-}
-
 // commitWithTrigger commits the current transaction and logs with the given trigger.
 func (w *BufferWriter) commitWithTrigger(trigger commitTrigger) error {
 	if w.tx == nil || w.buffer < 1 {
