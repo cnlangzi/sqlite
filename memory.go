@@ -3,7 +3,6 @@ package sqlite
 import (
 	"context"
 	"database/sql"
-	"time"
 )
 
 // openMemory opens an in-memory SQLite DB.
@@ -17,7 +16,7 @@ func openMemory(ctx context.Context, dsn string) (*DB, error) {
 	}
 
 	return &DB{
-		Writer: NewWriter(db, BufferConfig{Size: 100, FlushInterval: 100 * time.Millisecond}),
+		Writer: NewWriter(db, DefaultBufferConfig()),
 		Reader: db,
 		ctx:    ctx,
 	}, nil

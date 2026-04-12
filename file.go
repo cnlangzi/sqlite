@@ -10,7 +10,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"time"
 )
 
 // openFile opens a persistent SQLite database file with separate reader and
@@ -40,7 +39,7 @@ func openFile(ctx context.Context, dsn string) (*DB, error) {
 	}
 
 	return &DB{
-		Writer: NewWriter(writerDB, BufferConfig{Size: 100, FlushInterval: 100 * time.Millisecond}),
+		Writer: NewWriter(writerDB, DefaultBufferConfig()),
 		Reader: readerDB,
 		ctx:    ctx,
 	}, nil
