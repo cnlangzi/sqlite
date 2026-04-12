@@ -1,3 +1,53 @@
+# Binaries for programs and plugins
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Build directories
+/bin/
+/build/
+_output/
+
+# Go tooling
+*.coverprofile
+coverage.out
+testdata/
+
+# SQLite database files (ignore local test DBs)
+*.db
+*.sqlite
+*.sqlite3
+
+# Editor/IDE files
+# .vscode/
+.idea/
+.claude/
+*.suo
+*.ntvs*
+*.njsproj
+*.swp
+*.swo
+*.iml
+
+# macOS
+.DS_Store
+
+# Logs and temp files
+*.log
+*.tmp
+*~
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Misc
+.cache/
+node_modules/
 # If you prefer the allow list template instead of the deny list, see community template:
 # https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
 #
@@ -27,6 +77,13 @@ go.work.sum
 # env file
 .env
 
-# Editor/IDE
-# .idea/
-# .vscode/
+
+# VS Code Go debug (Delve) artifacts
+.vscode/.go-debug
+dlv
+dlv.exe
+debug.log
+trace.out
+
+
+
