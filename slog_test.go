@@ -2,9 +2,7 @@ package sqlite
 
 import (
 	"context"
-	"database/sql"
 	"log/slog"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -37,41 +35,40 @@ type testHandler struct {
 func (h *testHandler) Handle(_ context.Context, r slog.Record) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	entry := slogEntry{Level: r.Level.String()}
+	entry := slogEntry{
+		Level:  r.Level.String(),
+		Msg:    r.Message,
+	}
 
 	r.Attrs(func(a slog.Attr) bool {
 		switch a.Key {
-		case "msg":
-			if v, ok := a.Value.Any().(string); ok {
-				entry.Msg = v
-			}
 		case "buffer":
-			if v, ok := a.Value.Any().(int); ok {
-				entry.Buffer = v
+			if v, ok := a.Value.Any().(int64); ok {
+				entry.Buffer = int(v)
 			}
 		case "size_limit":
-			if v, ok := a.Value.Any().(int); ok {
-				entry.SizeLimit = v
+			if v, ok := a.Value.Any().(int64); ok {
+				entry.SizeLimit = int(v)
 			}
 		case "trigger":
 			if v, ok := a.Value.Any().(string); ok {
 				entry.Trigger = v
 			}
 		case "count":
-			if v, ok := a.Value.Any().(int); ok {
-				entry.Count = v
+			if v, ok := a.Value.Any().(int64); ok {
+				entry.Count = int(v)
 			}
 		case "elapsed":
-			if v, ok := a.Value.Any().(time.Duration); ok {
-				entry.Elapsed = v.String()
+			if v, ok := a.Value.Any().(int64); ok {
+				entry.Elapsed = time.Duration(v).String()
 			}
 		case "err":
 			if v, ok := a.Value.Any().(string); ok {
 				entry.Err = v
 			}
 		case "remaining_buffer":
-			if v, ok := a.Value.Any().(int); ok {
-				entry.RemainingBuffer = v
+			if v, ok := a.Value.Any().(int64); ok {
+				entry.RemainingBuffer = int(v)
 			}
 		}
 		return true
@@ -103,7 +100,8 @@ func findEntry(h *testHandler, msg string) *slogEntry {
 	defer h.mu.Unlock()
 	for i := range h.entries {
 		if h.entries[i].Msg == msg {
-			return &h.entries[i]
+			e := h.entries[i]
+			return &e
 		}
 	}
 	return nil
@@ -120,22 +118,6 @@ func countEntries(h *testHandler, msg string) int {
 		}
 	}
 	return n
-}
-
-func newTestDB(t *testing.T) (*sql.DB, func()) {
-	f, err := os.CreateTemp("", "slogtest-*.db")
-	require.NoError(t, err)
-	f.Close()
-
-	db, err := sql.Open("sqlite", f.Name()+"?_journal_mode=WAL&_synchronous=OFF")
-	require.NoError(t, err)
-	_, err = db.Exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
-	require.NoError(t, err)
-
-	return db, func() {
-		db.Close()
-		os.Remove(f.Name())
-	}
 }
 
 func TestSlog_SizeTriggeredFlush(t *testing.T) {
@@ -261,7 +243,7 @@ func TestSlog_CloseDrain(t *testing.T) {
 }
 
 func TestSlog_TaskBlocked(t *testing.T) {
-	h, cleanup := resetSlog(t)
+	_, cleanup := resetSlog(t)
 	defer cleanup()
 
 	db, dbCleanup := newTestDB(t)
@@ -280,7 +262,7 @@ func TestSlog_TaskBlocked(t *testing.T) {
 	defer bw.Close()
 
 	// First task should succeed
-	_, err := bw.Exec("INSERT INTO users (id, name) VALUES (1, 'a')")
+	_, _ = bw.Exec("INSERT INTO users (id, name) VALUES (1, 'a')")
 	// Might succeed or fail depending on timing
 
 	// Try to fill the channel

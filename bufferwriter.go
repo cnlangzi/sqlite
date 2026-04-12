@@ -123,10 +123,14 @@ func (w *BufferWriter) waitSingal() {
 			slog.Debug("buffered", slog.Int("buffer", w.buffer), slog.Int("size_limit", w.cfg.Size))
 
 			if task.Flush() || w.buffer >= w.cfg.Size {
-				slog.Debug("commit triggered", slog.String("trigger", string(triggerSize)), slog.Int("buffer", w.buffer))
-				if err := w.commitWithTrigger(triggerSize); err != nil {
+				trigger := triggerSize
+				if task.Flush() {
+					trigger = triggerManual
+				}
+				slog.Debug("commit triggered", slog.String("trigger", string(trigger)), slog.Int("buffer", w.buffer))
+				if err := w.commitWithTrigger(trigger); err != nil {
 					slog.Error("commit failed",
-						slog.String("trigger", string(triggerSize)),
+						slog.String("trigger", string(trigger)),
 						slog.Int("buffer", w.buffer),
 						slog.String("err", err.Error()))
 				}
@@ -161,13 +165,6 @@ func (w *BufferWriter) Flush() error {
 	result := <-task
 
 	return result.Error
-}
-
-// commit flushes any pending buffered statements by committing the current
-// transaction. If there is no pending work, it is a no-op. After a successful
-// commit, a new lazy transaction is started for subsequent writes.
-func (w *BufferWriter) commit() error {
-	return w.commitWithTrigger(triggerManual)
 }
 
 // commitWithTrigger commits the current transaction and logs with the given trigger.
