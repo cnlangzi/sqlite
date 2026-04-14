@@ -31,12 +31,6 @@ type TaskResult struct {
 	Error    error // any error that occurred during execution
 }
 
-// TaskArgs bundles a query string with its parameters for deferred execution.
-type TaskArgs struct {
-	query string
-	args  []any
-}
-
 // Task is a concrete implementation of TaskFunc that wraps a query and
 // its execution function. It is created by the package-level helper functions
 // Query, QueryRow, Exec, and Commit.
