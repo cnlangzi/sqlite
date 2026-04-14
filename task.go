@@ -1,8 +1,13 @@
 package sqlite
 
-import (
-	"database/sql"
-	"log/slog"
+type Action int
+
+const (
+	ActionQuery Action = iota
+	ActionExec
+	ActionBegin
+	ActionCommit
+	ActionRollback
 )
 
 // TaskFunc is the interface implemented by tasks submitted to the Writer.
@@ -10,27 +15,20 @@ import (
 type TaskFunc interface {
 	// Exec executes the task using the provided transaction. It returns
 	// the result of the execution (e.g., sql.Result for writes) or an error.
-	Exec(w *sql.Tx) TaskResult
+	Exec(bw *BufferWriter) TaskResult
 
 	// Notify returns a channel that receives the TaskResult once Exec completes.
 	// The caller uses this to wait for the task to finish.
 	Notify() chan TaskResult
 
-	// Flush returns true if this task should trigger an immediate commit.
-	// Used by Commit task to force a flush after buffering completes.
-	Flush() bool
+	Action() Action
 }
 
 // TaskResult holds the outcome of a task execution.
 type TaskResult struct {
-	Result any   // the execution result, typically a sql.Result or *sql.Row
-	Error  error // any error that occurred during execution
-}
-
-// TaskArgs bundles a query string with its parameters for deferred execution.
-type TaskArgs struct {
-	query string
-	args  []any
+	Result   any   // the execution result, typically a sql.Result or *sql.Row
+	Buffered bool  // true if the task was buffered and not executed immediately
+	Error    error // any error that occurred during execution
 }
 
 // Task is a concrete implementation of TaskFunc that wraps a query and
@@ -38,8 +36,8 @@ type TaskArgs struct {
 // Query, QueryRow, Exec, and Commit.
 type Task struct {
 	notify chan TaskResult
-	exec   func(tx *sql.Tx) TaskResult
-	flush  bool
+	exec   func(bw *BufferWriter) TaskResult
+	action Action
 }
 
 // Notify implements TaskFunc by returning the result channel.
@@ -48,13 +46,12 @@ func (t *Task) Notify() chan TaskResult {
 }
 
 // Exec implements TaskFunc by running the stored execution function.
-func (t *Task) Exec(tx *sql.Tx) TaskResult {
-	return t.exec(tx)
+func (t *Task) Exec(bw *BufferWriter) TaskResult {
+	return t.exec(bw)
 }
 
-// Flush implements TaskFunc by returning the stored flush flag.
-func (t *Task) Flush() bool {
-	return t.flush
+func (t *Task) Action() Action {
+	return t.action
 }
 
 // Query creates a read-only TaskFunc that executes a query with the given
@@ -63,10 +60,11 @@ func (t *Task) Flush() bool {
 func Query(query string, args ...any) TaskFunc {
 	return &Task{
 		notify: make(chan TaskResult, 1),
-		exec: func(tx *sql.Tx) TaskResult {
-			row := tx.QueryRow(query, args...)
+		exec: func(bw *BufferWriter) TaskResult {
+			row := bw.tx.QueryRow(query, args...)
 			return TaskResult{Result: row, Error: nil}
 		},
+		action: ActionExec,
 	}
 }
 
@@ -76,10 +74,11 @@ func Query(query string, args ...any) TaskFunc {
 func QueryRow(query string, args ...any) TaskFunc {
 	return &Task{
 		notify: make(chan TaskResult, 1),
-		exec: func(tx *sql.Tx) TaskResult {
-			row := tx.QueryRow(query, args...)
+		exec: func(bw *BufferWriter) TaskResult {
+			row := bw.tx.QueryRow(query, args...)
 			return TaskResult{Result: row, Error: nil}
 		},
+		action: ActionQuery,
 	}
 }
 
@@ -89,37 +88,75 @@ func QueryRow(query string, args ...any) TaskFunc {
 func Exec(query string, args ...any) TaskFunc {
 	return &Task{
 		notify: make(chan TaskResult, 1),
-		exec: func(tx *sql.Tx) TaskResult {
-			res, err := tx.Exec(query, args...)
-			return TaskResult{Result: res, Error: err}
+		exec: func(bw *BufferWriter) TaskResult {
+			res, err := bw.tx.Exec(query, args...)
+			if err != nil {
+				return TaskResult{Result: nil, Error: err}
+			}
+
+			return TaskResult{Result: res, Buffered: true, Error: err}
 		},
+		action: ActionExec,
+	}
+}
+
+func BeginTx() TaskFunc {
+	return &Task{
+		notify: make(chan TaskResult, 1),
+		exec: func(bw *BufferWriter) TaskResult {
+
+			err := bw.commitWithTrigger(triggerManual)
+			if err != nil {
+				return TaskResult{Result: nil, Error: err}
+			}
+
+			bw.tx, err = bw.DB.Begin()
+
+			if err != nil {
+				return TaskResult{Result: nil, Error: err}
+			}
+
+			bw.isPending = true
+
+			return TaskResult{}
+		},
+		action: ActionBegin,
 	}
 }
 
 // Commit creates a TaskFunc that commits the current transaction.
 // It also sets Flush() to true, ensuring any pending buffered writes
 // are flushed before this task is processed.
-func Commit(tasks ...TaskArgs) TaskFunc {
+func Commit() TaskFunc {
 	return &Task{
-		flush:  true,
 		notify: make(chan TaskResult, 1),
-		exec: func(tx *sql.Tx) TaskResult {
-			sp, err := NewSavepoint(tx)
+		exec: func(bw *BufferWriter) TaskResult {
+			err := bw.commitWithTrigger(triggerManual)
 			if err != nil {
-				slog.Error("sqlite: create savepoint", slog.String("err", err.Error()))
 				return TaskResult{Result: nil, Error: err}
 			}
+			bw.isPending = false
+			return TaskResult{Result: nil, Error: nil}
+		},
+		action: ActionCommit,
+	}
+}
 
-			defer sp.Release()
-
-			for _, stmt := range tasks {
-				if _, err := tx.Exec(stmt.query, stmt.args...); err != nil {
-					sp.Rollback()
-					return TaskResult{Result: nil, Error: err}
-				}
+func Rollback() TaskFunc {
+	return &Task{
+		notify: make(chan TaskResult, 1),
+		exec: func(bw *BufferWriter) TaskResult {
+			var err error
+			if bw.tx != nil {
+				err = bw.tx.Rollback()
 			}
+			bw.isPending = false
+			bw.tx = nil
+			bw.buffer = 0
 
 			return TaskResult{Result: nil, Error: err}
+
 		},
+		action: ActionRollback,
 	}
 }

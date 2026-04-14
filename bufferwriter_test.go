@@ -447,49 +447,56 @@ func TestWriter_Tx_CommitAfterClose(t *testing.T) {
 	assert.ErrorIs(t, err, ErrClosed)
 }
 
-// TestWriter_Tx_SavepointRollbackOnError verifies that when one statement
-// inside a Tx.Commit fails, the savepoint rolls back so the partially
-// executed statements do not leak into the global transaction, while
-// other independent writes are unaffected.
-func TestWriter_Tx_SavepointRollbackOnError(t *testing.T) {
-	db, cleanup := newTestDB(t)
-	defer cleanup()
+// TestWriter_Tx_RollbackOnError verifies that when one statement
+// inside a Tx fails, the error is returned immediately and a subsequent
+// Rollback undoes all prior statements in the transaction.
+func TestWriter_Tx_RollbackOnError(t *testing.T) {
 
-	bw := NewWriter(db, BufferConfig{
-		Size:          10,
-		FlushInterval: 10 * time.Second,
+	synctest.Test(t, func(t *testing.T) {
+
+		db, cleanup := newTestDB(t)
+		defer cleanup()
+
+		bw := NewWriter(db, BufferConfig{
+			Size:          10,
+			FlushInterval: 10 * time.Second,
+		})
+		defer bw.Close()
+
+		// Commit a row that will cause a PK conflict inside the Tx.
+		_, err := bw.Exec("INSERT INTO users (id, name) VALUES (1, 'existing')")
+		require.NoError(t, err)
+		require.NoError(t, bw.Flush())
+
+		tx, err := bw.BeginTx(context.Background(), nil)
+		require.NoError(t, err)
+		_, err = tx.Exec("INSERT INTO users (id, name) VALUES (2, 'ok')")
+		require.NoError(t, err)
+		_, err = tx.Exec("INSERT INTO users (id, name) VALUES (1, 'dup')") // PK conflict
+		assert.Error(t, err)                                               // error returned immediately
+
+		synctest.Wait()
+
+		// Caller must rollback on error; this undoes the id=2 insert too.
+		err = tx.Rollback()
+		require.NoError(t, err)
+
+		// The entire Tx should be rolled back; no new rows added.
+		var count int
+		err = db.QueryRow("SELECT COUNT(*) FROM users").Scan(&count)
+		require.NoError(t, err)
+		assert.Equal(t, 1, count)
+
+		// Writer should still be usable after a failed Tx.
+		_, err = bw.Exec("INSERT INTO users (id, name) VALUES (3, 'after')")
+		assert.NoError(t, err)
+		require.NoError(t, bw.Flush())
+
+		err = db.QueryRow("SELECT COUNT(*) FROM users").Scan(&count)
+		require.NoError(t, err)
+		assert.Equal(t, 2, count)
+
 	})
-	defer bw.Close()
-
-	// Commit a row that will cause a PK conflict inside the Tx.
-	_, err := bw.Exec("INSERT INTO users (id, name) VALUES (1, 'existing')")
-	require.NoError(t, err)
-	require.NoError(t, bw.Flush())
-
-	tx, err := bw.BeginTx(context.Background(), nil)
-	require.NoError(t, err)
-	_, err = tx.Exec("INSERT INTO users (id, name) VALUES (2, 'ok')")
-	require.NoError(t, err)
-	_, err = tx.Exec("INSERT INTO users (id, name) VALUES (1, 'dup')") // PK conflict
-	require.NoError(t, err)
-
-	err = tx.Commit()
-	assert.Error(t, err) // should fail due to PK conflict
-
-	// The entire Tx should be rolled back; no new rows added.
-	var count int
-	err = db.QueryRow("SELECT COUNT(*) FROM users").Scan(&count)
-	require.NoError(t, err)
-	assert.Equal(t, 1, count)
-
-	// Writer should still be usable after a failed Tx.
-	_, err = bw.Exec("INSERT INTO users (id, name) VALUES (3, 'after')")
-	assert.NoError(t, err)
-	require.NoError(t, bw.Flush())
-
-	err = db.QueryRow("SELECT COUNT(*) FROM users").Scan(&count)
-	require.NoError(t, err)
-	assert.Equal(t, 2, count)
 }
 
 // TestWriter_ConcurrentBeginTxCommit verifies that multiple goroutines

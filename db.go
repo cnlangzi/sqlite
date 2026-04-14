@@ -112,3 +112,7 @@ func (db *DB) QueryRow(query string, args ...interface{}) *sql.Row {
 func (db *DB) QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row {
 	return db.Reader.QueryRowContext(ctx, query, args...)
 }
+
+func (db *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
+	return db.Writer.BeginTx(ctx, opts)
+}
