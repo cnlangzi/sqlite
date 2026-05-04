@@ -41,19 +41,6 @@ func openFile(ctx context.Context, dsn string) (*DB, error) {
 
 	writer := NewWriter(writerDB, DefaultBufferConfig())
 
-	// Set reader sync callback to invalidate mmap after commit.
-	// This forces the reader to get a fresh read snapshot.
-	// The writer runs WAL checkpoint (PASSIVE) to push committed data.
-	// The reader runs a no-op to abort any stale read and get new data.
-	writer.SetReaderSync(func() {
-		// Passive checkpoint on writer ensures data is checkpointed.
-		// We ignore errors since checkpoint may not complete if readers are active.
-		_, _ = writerDB.Exec("PRAGMA wal_checkpoint(PASSIVE)")
-		// No-op on reader forces it to abort any stale read and get fresh data.
-		// Using a simple query ensures mmap is re-read from disk.
-		_, _ = readerDB.Exec("SELECT 1")
-	})
-
 	return &DB{
 		Writer: writer,
 		Reader: readerDB,
