@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"runtime"
@@ -38,8 +39,23 @@ func openFile(ctx context.Context, dsn string) (*DB, error) {
 		return nil, err
 	}
 
+	writer := NewWriter(writerDB, DefaultBufferConfig())
+
+	// Set reader sync callback to invalidate mmap after commit.
+	// This forces the reader to get a fresh read snapshot.
+	// The writer runs WAL checkpoint (PASSIVE) to push committed data.
+	// The reader runs a no-op to abort any stale read and get new data.
+	writer.SetReaderSync(func() {
+		// Passive checkpoint on writer ensures data is checkpointed.
+		// We ignore errors since checkpoint may not complete if readers are active.
+		_, _ = writerDB.Exec("PRAGMA wal_checkpoint(PASSIVE)")
+		// No-op on reader forces it to abort any stale read and get fresh data.
+		// Using a simple query ensures mmap is re-read from disk.
+		_, _ = readerDB.Exec("SELECT 1")
+	})
+
 	return &DB{
-		Writer: NewWriter(writerDB, DefaultBufferConfig()),
+		Writer: writer,
 		Reader: readerDB,
 		ctx:    ctx,
 	}, nil
@@ -104,15 +120,12 @@ func writerDSN(file string) string {
 
 // readerDSN constructs a SQLite DSN for the reader connection with mode=ro
 // (read-only) and pragmas tuned for read performance, including private cache
-// to avoid cache synchronization overhead, mmap for zero-copy reads, and
-// thread count matching CPU count for parallel queries.
+// to avoid cache synchronization overhead and thread count matching CPU count for parallel queries.
 func readerDSN(file string) string {
 	params := url.Values{}
 	params.Add("mode", "ro")
 	params.Add("cache", "private")
 	params.Add("_busy_timeout", "5000")
-	params.Add("_query_only", "true")
-	params.Add("_pragma", fmt.Sprintf("mmap_size(%d)", mmapSizeBytes()))
 	params.Add("_pragma", "temp_store(MEMORY)")
 	params.Add("_pragma", fmt.Sprintf("cache_size(-%d)", readerCacheSizeKB()))
 	params.Add("_pragma", fmt.Sprintf("threads(%d)", runtime.NumCPU()))
@@ -190,26 +203,3 @@ func readerCacheSizeKB() int64 {
 	return target
 }
 
-// mmapSizeBytes returns the SQLite mmap_size in bytes for reader connections.
-// It targets 50% of available memory, clamped to the range [256 MB, 128 GB],
-// with a 1 GB fallback when available memory cannot be determined. Large mmap
-// allows multiple reader connections to share the OS page cache (zero-copy on Linux).
-func mmapSizeBytes() int64 {
-	const (
-		minBytes     = 256 << 20      // 256 MB
-		maxBytes     = 128 << 30      // 128 GB
-		defaultBytes = int64(1 << 30) // 1 GB fallback
-	)
-	mem := availableMemoryKB()
-	if mem == 0 {
-		return defaultBytes
-	}
-	target := mem * 512 // KiB * 512 = 50% of RAM in bytes
-	if target < minBytes {
-		return minBytes
-	}
-	if target > maxBytes {
-		return maxBytes
-	}
-	return target
-}
