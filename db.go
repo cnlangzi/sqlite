@@ -31,23 +31,29 @@ func isInMemory(dsn string) bool {
 // defaults to ":memory:" (an in-memory database). For file paths, the file
 // is created if it does not exist. This is an alias for Open; prefer Open
 // for clarity in application code.
-func New(ctx context.Context, dsn string) (*DB, error) {
+//
+// Optional Option arguments (such as WithReadPRAGMA / WithWritePRAGMA)
+// customize the reader and writer connections.
+func New(ctx context.Context, dsn string, opts ...Option) (*DB, error) {
 	if dsn == "" {
 		dsn = ":memory:"
 	}
 
 	if isInMemory(dsn) {
-		return openMemory(ctx, dsn)
+		return openMemory(ctx, dsn, opts)
 	}
 
-	return openFile(ctx, dsn)
+	return openFile(ctx, dsn, opts)
 }
 
 // Open opens a SQLite database from the given DSN. If DSN is empty, it
 // defaults to ":memory:" (an in-memory database). For file paths, the file
 // is created if it does not exist. This is the preferred constructor.
-func Open(ctx context.Context, dsn string) (*DB, error) {
-	return New(ctx, dsn)
+//
+// Optional Option arguments (such as WithReadPRAGMA / WithWritePRAGMA)
+// customize the reader and writer connections.
+func Open(ctx context.Context, dsn string, opts ...Option) (*DB, error) {
+	return New(ctx, dsn, opts...)
 }
 
 func (db *DB) Flush() error {
