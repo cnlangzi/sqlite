@@ -60,6 +60,82 @@ func TestApplyOptions_MultiGroupAppendOrder(t *testing.T) {
 	)
 }
 
+// TestDefaultReadPragmas_MatchesPrivateDefault verifies the public
+// snapshot is byte-for-byte the same list Open applies when no
+// WithReadPRAGMA was given. Mismatches here make user-facing recovery
+// recipes (spread DefaultReadPragmas to keep defaults) silently
+// disagree with Open.
+func TestDefaultReadPragmas_MatchesPrivateDefault(t *testing.T) {
+	assert.Equal(t, defaultReaderPragmas(), DefaultReadPragmas())
+}
+
+// TestDefaultWritePragmas_MatchesPrivateDefault mirrors the reader
+// test for the writer.
+func TestDefaultWritePragmas_MatchesPrivateDefault(t *testing.T) {
+	assert.Equal(t, defaultWriterPragmas(), DefaultWritePragmas())
+}
+
+// TestNewPragmaConnector_ApplyOnOpen verifies the connector runs the
+// PRAGMA list before the connection becomes usable (Ping surfaces the
+// PRAGMA). This is the property that guarantees every replacement
+// connection — created when database/sql drops an idle conn — also
+// carries the PRAGMAs.
+func TestNewPragmaConnector_ApplyOnOpen(t *testing.T) {
+	d := sql.OpenDB(newPragmaConnector(":memory:",
+		[]string{"secure_delete = ON"},
+	))
+	defer func() { _ = d.Close() }()
+
+	var v int
+	require.NoError(t, d.QueryRow("PRAGMA secure_delete").Scan(&v))
+	assert.Equal(t, 1, v, "expected secure_delete=ON applied at Connect")
+}
+
+// TestOpen_File_PragmasPersistAcrossConnReplacements forces database/sql
+// to recycle a pooled connection by closing every acquired conn, then
+// queries PRAGMAs through a brand-new pool connection. The connector
+// must re-apply the PRAGMAs on the replacement — without that, a caller
+// override would silently regress.
+func TestOpen_File_PragmasPersistAcrossConnReplacements(t *testing.T) {
+	tmp := t.TempDir() + "/replace.db"
+	db, err := Open(context.Background(), tmp,
+		WithReadPRAGMA("secure_delete = ON"),
+	)
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	// Acquire + close a connection so the next query opens a fresh one.
+	c, err := db.Reader.Conn(context.Background())
+	require.NoError(t, err)
+	require.NoError(t, c.Close())
+
+	// database/sql will create a replacement connection on the next
+	// Query; the connector applies PRAGMAs to that new conn.
+	var v int
+	require.NoError(t, db.Reader.QueryRow("PRAGMA secure_delete").Scan(&v))
+	assert.Equal(t, 1, v, "expected secure_delete=ON even on a replacement pool conn")
+}
+
+// TestOpen_Memory_WriterPRAGMAWinsOverReaderDefault verifies the
+// per-side replace-with-caller-last ordering: a caller-supplied
+// writer PRAGMA must NOT be clobbered by reader defaults that share
+// the same name.
+func TestOpen_Memory_WriterPRAGMAWinsOverReaderDefault(t *testing.T) {
+	db, err := Open(context.Background(), ":memory:",
+		// Only writer is provided — reader defaults still apply, but
+		// the writer's explicit temp_store = FILE must win.
+		WithWritePRAGMA("temp_store = FILE"),
+	)
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	// Note: temp_store constants are 0=DEFAULT, 1=FILE, 2=MEMORY.
+	var v int
+	require.NoError(t, db.Reader.QueryRow("PRAGMA temp_store").Scan(&v))
+	assert.Equal(t, 1, v,
+		"expected temp_store=FILE (1) — caller PRAGMA must win over reader default MEMORY (2)")
+}
+
 // TestApplyOptions_ProvidedFlag verifies that the *Provided flag is set
 // by WithReadPRAGMA / WithWritePRAGMA but stays false when neither is
 // called. The flag gates replace semantics: when true, built-in
@@ -176,11 +252,13 @@ func TestOpen_Memory_ReplacePerSide(t *testing.T) {
 }
 
 // TestDefaultReadPragmas_NonEmpty ensures the public snapshot helper
-// returns a usable baseline (non-empty, contains a known built-in).
+// returns a usable baseline (non-empty, includes the busy_timeout
+// built-in that defaultReaderPragmas uses).
 func TestDefaultReadPragmas_NonEmpty(t *testing.T) {
 	got := DefaultReadPragmas()
 	require.NotEmpty(t, got)
-	assert.Contains(t, got[0], "temp_store")
+	assert.Contains(t, got[0], "busy_timeout")
+	assert.Contains(t, strings.Join(got, ", "), "temp_store")
 }
 
 // TestDefaultWritePragmas_NonEmpty mirrors the reader test for the writer.

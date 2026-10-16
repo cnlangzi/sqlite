@@ -12,11 +12,11 @@ import (
 // Using separate connections would result in each connection seeing a different database.
 //
 // Optional Option arguments customize the single shared connection (see
-// WithReadPRAGMA / WithWritePRAGMA). Replace semantics apply per-side:
-// the writer slot uses cfg.writerPragmas if cfg.writerProvided, otherwise
-// defaultWriterPragmas(); the reader slot behaves analogously. The two
-// PRAGMA lists are concatenated and applied to the single shared
-// connection in declaration order.
+// WithReadPRAGMA / WithWritePRAGMA). Per-side replace semantics: when a
+// side's helper was invoked, only that side's caller list runs; otherwise
+// that side's defaults run. The two lists are concatenated in defaults-
+// first, callers-last order so any caller PRAGMA of the same name wins
+// regardless of which side it was set on.
 func openMemory(ctx context.Context, dsn string, opts []Option) (*DB, error) {
 	cfg := applyOptions(opts)
 
@@ -37,17 +37,31 @@ func openMemory(ctx context.Context, dsn string, opts []Option) (*DB, error) {
 // in-memory databases exist only within their owning connection; a
 // second connection would see a completely different (empty) database.
 //
-// cfg governs the PRAGMA list applied to the single shared connection.
-// Per-side replace semantics: the writer slot uses cfg.writerPragmas
-// when cfg.writerProvided is true, otherwise defaultWriterPragmas();
-// the reader slot behaves analogously. The two lists are concatenated
-// (writer first, reader after) since order matters for same-name
-// PRAGMAs (last-wins).
+// Per-side replace semantics on the shared connection:
+//   - Writer slot: cfg.writerPragmas if cfg.writerProvided, otherwise
+//     defaultWriterPragmas().
+//   - Reader slot: cfg.readerPragmas if cfg.readerProvided, otherwise
+//     defaultReaderPragmas().
+//
+// The two lists are concatenated in defaults-first, callers-last order
+// so a caller PRAGMA of the same name overrides the corresponding
+// default (last-write-wins at the connector's Connect time).
 func openMemoryDB(ctx context.Context, dsn string, cfg *options) (*sql.DB, error) {
-	d, err := sql.Open("sqlite3", memoryDSN(dsn))
-	if err != nil {
-		return nil, err
+	pragmas := []string{}
+	if !cfg.writerProvided {
+		pragmas = append(pragmas, defaultWriterPragmas()...)
 	}
+	if !cfg.readerProvided {
+		pragmas = append(pragmas, defaultReaderPragmas()...)
+	}
+	if cfg.writerProvided {
+		pragmas = append(pragmas, cfg.writerPragmas...)
+	}
+	if cfg.readerProvided {
+		pragmas = append(pragmas, cfg.readerPragmas...)
+	}
+
+	d := sql.OpenDB(newPragmaConnector(memoryDSN(dsn), pragmas))
 
 	// Single connection: in-memory DBs are not shared across connections.
 	d.SetMaxOpenConns(1)
@@ -59,28 +73,12 @@ func openMemoryDB(ctx context.Context, dsn string, cfg *options) (*sql.DB, error
 		return nil, err
 	}
 
-	var pragmas []string
-	if cfg.writerProvided {
-		pragmas = append(pragmas, cfg.writerPragmas...)
-	} else {
-		pragmas = append(pragmas, defaultWriterPragmas()...)
-	}
-	if cfg.readerProvided {
-		pragmas = append(pragmas, cfg.readerPragmas...)
-	} else {
-		pragmas = append(pragmas, defaultReaderPragmas()...)
-	}
-	if err := applyPragmas(ctx, d, pragmas); err != nil {
-		_ = d.Close()
-		return nil, err
-	}
-
 	return d, nil
 }
 
 // memoryDSN appends mode=memory to the given DSN so go-sqlite3 creates
-// an in-memory database. PRAGMAs are applied separately via applyPragmas
-// after the connection opens — see writerDSN for the rationale.
+// an in-memory database. PRAGMAs are applied by the pragmaConnector on
+// every Connect — see writerDSN for the rationale.
 func memoryDSN(dsn string) string {
 	params := url.Values{}
 	params.Add("mode", "memory")

@@ -57,15 +57,16 @@ func openFile(ctx context.Context, dsn string, opts []Option) (*DB, error) {
 // Only one connection is used because SQLite requires serialized write access;
 // a single connection naturally serializes all writes without additional locking.
 //
-// cfg governs whether the package's built-in writer defaults apply: when
-// cfg.writerProvided is true (the caller invoked WithWritePRAGMA at least
-// once), only cfg.writerPragmas run; otherwise defaultWriterPragmas() is
-// used. Replace semantics — see WithWritePRAGMA for details.
+// cfg governs which PRAGMA list runs at every Connect (per
+// newPragmaConnector): cfg.writerPragmas if cfg.writerProvided is true,
+// otherwise defaultWriterPragmas(). Replace semantics — see
+// WithWritePRAGMA for details.
 func openWriterDB(ctx context.Context, dsn string, cfg *options) (*sql.DB, error) {
-	d, err := sql.Open("sqlite3", writerDSN(dsn))
-	if err != nil {
-		return nil, err
+	pragmas := cfg.writerPragmas
+	if !cfg.writerProvided {
+		pragmas = defaultWriterPragmas()
 	}
+	d := sql.OpenDB(newPragmaConnector(writerDSN(dsn), pragmas))
 
 	// Single connection serializes all writes.
 	d.SetMaxOpenConns(1)
@@ -77,31 +78,22 @@ func openWriterDB(ctx context.Context, dsn string, cfg *options) (*sql.DB, error
 		return nil, err
 	}
 
-	pragmas := cfg.writerPragmas
-	if !cfg.writerProvided {
-		pragmas = defaultWriterPragmas()
-	}
-	if err := applyPragmas(ctx, d, pragmas); err != nil {
-		_ = d.Close()
-		return nil, err
-	}
-
 	return d, nil
 }
 
 // openReaderDB opens a connection pool *sql.DB optimized for concurrent reads.
 // The pool size scales with CPU count to maximize read throughput.
 //
-// cfg governs whether the package's built-in reader defaults apply: when
-// cfg.readerProvided is true, only cfg.readerPragmas run; otherwise
-// defaultReaderPragmas() is used. Because the reader uses a connection
-// pool, the chosen PRAGMA list is applied to every pooled connection via
-// applyPragmasToPool.
+// cfg governs which PRAGMA list runs at every Connect (per
+// newPragmaConnector): cfg.readerPragmas if cfg.readerProvided is true,
+// otherwise defaultReaderPragmas(). The pragmaConnector guarantees every
+// pool connection — initial and replacement — gets the chosen PRAGMAs.
 func openReaderDB(ctx context.Context, dsn string, cfg *options) (*sql.DB, error) {
-	d, err := sql.Open("sqlite3", readerDSN(dsn))
-	if err != nil {
-		return nil, err
+	pragmas := cfg.readerPragmas
+	if !cfg.readerProvided {
+		pragmas = defaultReaderPragmas()
 	}
+	d := sql.OpenDB(newPragmaConnector(readerDSN(dsn), pragmas))
 
 	// Scale reader pool with CPU count.
 	conns := max(10, runtime.NumCPU()*2)
@@ -114,15 +106,6 @@ func openReaderDB(ctx context.Context, dsn string, cfg *options) (*sql.DB, error
 		return nil, err
 	}
 
-	pragmas := cfg.readerPragmas
-	if !cfg.readerProvided {
-		pragmas = defaultReaderPragmas()
-	}
-	if err := applyPragmasToPool(ctx, d, conns, pragmas); err != nil {
-		_ = d.Close()
-		return nil, err
-	}
-
 	return d, nil
 }
 
@@ -130,18 +113,17 @@ func openReaderDB(ctx context.Context, dsn string, cfg *options) (*sql.DB, error
 // mode=rwc (read-write-create). Only connection-open settings that
 // cannot be expressed as a PRAGMA statement live here; every actual
 // PRAGMA (journal_mode, synchronous, busy_timeout, temp_store,
-// cache_size) is applied via applyPragmas so caller PRAGMAs can
-// override the built-ins via last-wins execution order.
+// cache_size) is applied via the pragmaConnector on every Connect.
 func writerDSN(file string) string {
 	params := url.Values{}
 	params.Add("mode", "rwc")
 	return file + "?" + params.Encode()
 }
 
-// readerDSN constructs a SQLite DSN for the reader connection. mode=ro
-// is the only DSN-level setting because it is the connection's open
-// mode (not a PRAGMA); every PRAGMA is applied separately via
-// applyPragmas, see writerDSN for the rationale.
+// readerDSN constructs a SQLite DSN for the reader connection.
+// mode=ro is the only DSN-level setting because it is the connection's
+// open mode (not a PRAGMA); every PRAGMA is applied via the
+// pragmaConnector, see writerDSN for the rationale.
 func readerDSN(file string) string {
 	params := url.Values{}
 	params.Add("mode", "ro")
@@ -149,15 +131,13 @@ func readerDSN(file string) string {
 }
 
 // defaultWriterPragmas returns the built-in writer PRAGMA spec list
-// evaluated at call time (cache_size depends on host memory). Kept private
-// (vs. DefaultWritePragmas) because openFile needs a fresh snapshot each
-// time; callers wanting a snapshot should use DefaultWritePragmas directly.
+// evaluated at call time (cache_size depends on host memory). The list
+// is the single source of truth that DefaultWritePragmas publicly
+// surfaces; both openFile and call sites read from this helper.
 //
-// Order matters: caller-supplied PRAGMAs run AFTER these defaults, so a
-// same-name caller PRAGMA wins via SQLite's last-wins execution. The
-// list also places SQL action before predicate-style PRAGMAs (cache_size)
-// because journal/synchronous/lock changes have to commit before the
-// cache is sized.
+// Ordering matters: action-style PRAGMAs (journal_mode, synchronous,
+// busy_timeout) run before predicate-style PRAGMAs (cache_size) so the
+// connection state is stable before the cache is sized.
 func defaultWriterPragmas() []string {
 	return []string{
 		"journal_mode = WAL",
@@ -168,8 +148,8 @@ func defaultWriterPragmas() []string {
 	}
 }
 
-// defaultReaderPragmas returns the built-in reader PRAGMA spec list. See
-// defaultWriterPragmas for the private vs. exported rationale.
+// defaultReaderPragmas returns the built-in reader PRAGMA spec list.
+// DefaultReadPragmas publicly surfaces the same content.
 func defaultReaderPragmas() []string {
 	return []string{
 		"busy_timeout = 5000",
@@ -177,64 +157,6 @@ func defaultReaderPragmas() []string {
 		fmt.Sprintf("cache_size = -%d", readerCacheSizeKB()),
 		fmt.Sprintf("threads = %d", runtime.NumCPU()),
 	}
-}
-
-// applyPragmas runs the given PRAGMA statements against a single-connection
-// *sql.DB (writer path). Calling database/sql.DB.Conn pins one connection
-// from the pool; with SetMaxOpenConns(1) on the writer this is always the
-// only connection. An empty pragmas slice is a no-op.
-func applyPragmas(ctx context.Context, db *sql.DB, pragmas []string) error {
-	if len(pragmas) == 0 {
-		return nil
-	}
-	conn, err := db.Conn(ctx)
-	if err != nil {
-		return fmt.Errorf("acquire connection for PRAGMAs: %w", err)
-	}
-	defer func() { _ = conn.Close() }()
-
-	return execPragmas(ctx, conn, pragmas)
-}
-
-// applyPragmasToPool eagerly opens n connections in the pool and applies
-// the given PRAGMAs to each, so every pooled connection carries them. With
-// SetMaxOpenConns(n) == SetMaxIdleConns(n), database/sql does not grow
-// the pool beyond n in steady state, so this approach covers all
-// connections the pool will use. An empty pragmas slice is a no-op.
-func applyPragmasToPool(ctx context.Context, db *sql.DB, n int, pragmas []string) error {
-	if len(pragmas) == 0 {
-		return nil
-	}
-	conns := make([]*sql.Conn, 0, n)
-	defer func() {
-		for _, c := range conns {
-			_ = c.Close() // returns the conn to the pool, does not close the underlying SQLite handle
-		}
-	}()
-	for i := 0; i < n; i++ {
-		c, err := db.Conn(ctx)
-		if err != nil {
-			return fmt.Errorf("acquire connection %d/%d for PRAGMAs: %w", i+1, n, err)
-		}
-		conns = append(conns, c)
-		if err := execPragmas(ctx, c, pragmas); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// execPragmas runs each PRAGMA statement via ExecContext on the given
-// pinned connection. PRAGMAs are SQL statements so they can be issued as
-// regular DDL/DML, but the caller is expected to provide the SQL fragment
-// after the "PRAGMA" keyword (e.g. "cache_size = -64000").
-func execPragmas(ctx context.Context, conn *sql.Conn, pragmas []string) error {
-	for _, p := range pragmas {
-		if _, err := conn.ExecContext(ctx, "PRAGMA "+p); err != nil {
-			return fmt.Errorf("apply PRAGMA %q: %w", p, err)
-		}
-	}
-	return nil
 }
 
 // availableMemoryKB returns the currently available memory of the system in KiB
