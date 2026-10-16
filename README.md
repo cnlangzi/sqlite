@@ -188,6 +188,11 @@ path (normal return, error, panic, closed writer).
 The caller must **not** invoke `tx.Commit` or `tx.Rollback` from inside
 `fn` — `Batch` owns the transaction lifecycle. If `fn` does call them,
 `Batch` will surface `sql.ErrTxDone` from its own commit/rollback step.
+The caller must also **not** invoke `db.Exec` / `db.ExecContext` /
+`db.BeginTx` / `db.Batch` / `db.Flush` from inside `fn` — reentry would
+deadlock the writer (the flush goroutine that is running `fn` is also the
+only goroutine that drains the task channel, and `txMu` is not
+reentrant). Execute statements via the `*sql.Tx` passed to `fn` instead.
 No per-statement `sql.Result` is returned; use `BeginTx` when that is
 required.
 

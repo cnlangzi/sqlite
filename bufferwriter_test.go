@@ -768,3 +768,53 @@ func TestBatch_AfterClose(t *testing.T) {
 	_, err = bw.Exec("INSERT INTO users (id, name) VALUES (1, 'a')")
 	assert.ErrorIs(t, err, ErrClosed)
 }
+
+// TestBatch_RecoversFromLeakedPoolConnection verifies that Batch handles the
+// state where a prior code path left bw.tx set with no buffered statements
+// (so commitWithTrigger skipped it). With the writer pool configured at
+// SetMaxOpenConns(1) — the production default from openFile / openMemory —
+// a stranded *sql.Tx would otherwise block BeginTx forever.
+//
+// The leak is induced through the public API: BeginTx opens bw.tx and sets
+// bw.isPending=true; Commit (with no Exec in between) leaves bw.tx dangling
+// because commitWithTrigger returns early when buffer < 1.
+func TestBatch_RecoversFromLeakedPoolConnection(t *testing.T) {
+	rawDB, cleanup := newTestDB(t)
+	defer cleanup()
+	rawDB.SetMaxOpenConns(1)
+
+	bw := NewWriter(rawDB, BufferConfig{
+		Size:          100,
+		FlushInterval: 100 * time.Millisecond,
+	})
+	defer bw.Close()
+	d := &DB{Writer: bw, Reader: rawDB}
+
+	// Induce the leak: BeginTx opens a tx on bw, Commit-without-Exec leaves
+	// bw.tx set holding the only writer-pool connection.
+	tx, err := bw.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	// Without Batch's defensive cleanup, BeginTx inside Batch would block
+	// forever on the full single-connection pool. Run in a goroutine with
+	// a hard timeout so a hang surfaces as a clear failure.
+	done := make(chan error, 1)
+	go func() {
+		done <- d.Batch(func(tx *sql.Tx) error {
+			_, err := tx.Exec("INSERT INTO users (id, name) VALUES (1, 'a')")
+			return err
+		})
+	}()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Batch deadlocked: a stranded bw.tx held the only writer connection")
+	}
+
+	var count int
+	require.NoError(t, rawDB.QueryRow("SELECT COUNT(*) FROM users").Scan(&count))
+	assert.Equal(t, 1, count)
+}
