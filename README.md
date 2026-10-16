@@ -161,6 +161,100 @@ if err != nil {
 sp.Release() // or sp.Rollback() to undo
 ```
 
+### Batch (Atomic Closure)
+
+`Batch` wraps an arbitrary closure in a single atomic transaction. The
+framework owns `Begin`/`Commit`/`Rollback`; the closure is the only thing
+the caller writes. The closure receives a real `*sql.Tx`, so existing
+helpers like `NewSavepoint` compose naturally.
+
+```go
+// Atomic, closure-based batch.
+func (db *DB) Batch(fn func(*sql.Tx) error) error
+```
+
+Semantics:
+
+| `fn` returns | Transaction | `Batch` returns |
+|--------------|-------------|-----------------|
+| `nil`        | committed   | `nil`           |
+| non-nil error| rolled back | the error       |
+| panic        | rolled back | `fmt.Errorf("sqlite: batch panic: %v", r)` (panic is recovered) |
+
+`Batch` is mutually exclusive with `Exec`/`ExecContext`/`BeginTx` for its
+entire lifetime via the Writer's `txMu`. The lock is released on every exit
+path (normal return, error, panic, closed writer).
+
+The caller must **not** invoke `tx.Commit` or `tx.Rollback` from inside
+`fn` — `Batch` owns the transaction lifecycle. If `fn` does call them,
+`Batch` will surface `sql.ErrTxDone` from its own commit/rollback step.
+No per-statement `sql.Result` is returned; use `BeginTx` when that is
+required.
+
+When to prefer `Batch` over `BeginTx`:
+
+| Concern                       | `Batch`                          | `BeginTx`                              |
+|------------------------------|----------------------------------|----------------------------------------|
+| Channel ops (N statements)   | 1                                | N + 2                                  |
+| Per-statement `sql.Result`   | not exposed                     | exposed                                |
+| User-facing tx handle         | none (closure-only)             | `*Tx` with `Exec`/`Commit`/`Rollback`  |
+| Nested `NewSavepoint`        | works (closure gets `*sql.Tx`)  | works                                  |
+| Mutually exclusive with writes| yes                             | yes                                    |
+
+Example — bulk insert:
+
+```go
+err := db.Batch(func(tx *sql.Tx) error {
+    for _, u := range users {
+        if _, err := tx.Exec(
+            "INSERT INTO users(name, age) VALUES(?, ?)",
+            u.Name, u.Age,
+        ); err != nil {
+            return err
+        }
+    }
+    return nil
+})
+```
+
+Example — read then write inside one transaction:
+
+```go
+err := db.Batch(func(tx *sql.Tx) error {
+    var current int
+    if err := tx.QueryRow(
+        "SELECT balance FROM accounts WHERE id = ?", id,
+    ).Scan(&current); err != nil {
+        return err
+    }
+    if current < amount {
+        return errors.New("insufficient balance")
+    }
+    _, err := tx.Exec(
+        "UPDATE accounts SET balance = balance - ? WHERE id = ?",
+        amount, id,
+    )
+    return err
+})
+```
+
+Example — nested savepoint:
+
+```go
+err := db.Batch(func(tx *sql.Tx) error {
+    sp, err := sqlite.NewSavepoint(tx)
+    if err != nil {
+        return err
+    }
+    if _, err := tx.Exec("INSERT INTO audit (...) VALUES (...)"); err != nil {
+        sp.Rollback() // undo only this insert
+        return err
+    }
+    sp.Release()
+    return nil
+})
+```
+
 ## Structured Logging
 
 The package uses `log/slog` for structured logging at key points in the writer/buffer pipeline. Configure the slog level and handler as needed.
