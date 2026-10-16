@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql/driver"
 	"fmt"
-	"runtime"
 
 	"github.com/mattn/go-sqlite3"
 )
@@ -83,29 +82,15 @@ func WithWritePRAGMA(pragmas ...string) Option {
 //	    sqlite.DefaultReadPragmas()...,        // adopt the package baseline
 //	)
 //
-// Caller-supplied same-name PRAGMAs override the built-in. Same-name
-// PRAGMAs that mattn exposes in both DSN form (busy_timeout) and
-// connector form are equivalent: anything passed via Exec wins for
-// the same name (last-write-wins).
+// Caller-supplied same-name PRAGMAs override the built-in (last-wins).
 func DefaultReadPragmas() []string {
-	return []string{
-		"busy_timeout = 5000",
-		"temp_store = MEMORY",
-		fmt.Sprintf("cache_size = -%d", readerCacheSizeKB()),
-		fmt.Sprintf("threads = %d", runtime.NumCPU()),
-	}
+	return defaultReaderPragmas()
 }
 
 // DefaultWritePragmas returns the full set of writer-side built-in
 // PRAGMAs. See DefaultReadPragmas for usage notes.
 func DefaultWritePragmas() []string {
-	return []string{
-		"journal_mode = WAL",
-		"synchronous = NORMAL",
-		"busy_timeout = 5000",
-		"temp_store = MEMORY",
-		fmt.Sprintf("cache_size = -%d", writerCacheSizeKB()),
-	}
+	return defaultWriterPragmas()
 }
 
 // applyOptions runs each option against a freshly allocated options

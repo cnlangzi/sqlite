@@ -136,26 +136,39 @@ func readerDSN(file string) string {
 	return file + "?" + params.Encode()
 }
 
-// defaultWriterPragmas returns the connector-side default PRAGMAs for
-// the writer — those mattn does NOT expose as first-class DSN keys.
-// (journal_mode, synchronous, busy_timeout live in the DSN; see
-// writerDSN.) Caller-supplied PRAGMAs run after this list, so a
-// same-name caller PRAGMA wins via SQLite's last-write-wins.
+// defaultWriterPragmas returns the full built-in writer PRAGMA list
+// (the canonical optimized set), evaluated at call time — cache_size
+// depends on host memory. Open applies this list end-to-end:
 //
-// Ordering: the cache is sized last because it depends on the
-// journal/synchronous/busy_timeout state already being in place.
+//  1. mattn-applied subset: journal_mode, synchronous, busy_timeout
+//     are also expressed as mattn DSN keys in writerDSN, so the driver
+//     applies them at connection-open time.
+//  2. pragmaConnector at every Connect: this same list is run as
+//     PRAGMA statements. Caller-supplied PRAGMAs come after, so a
+//     same-name caller PRAGMA wins via SQLite's last-write-wins.
+//
+// The dual application is harmless — every PRAGMA in step 1 is
+// idempotent under SQLite, so running it twice in step 2 produces the
+// same end state as running it once.
+//
+// Ordering: action-style PRAGMAs (journal_mode, synchronous,
+// busy_timeout, temp_store) run before the cache is sized, because
+// cache_size depends on the connection state being stable.
 func defaultWriterPragmas() []string {
 	return []string{
+		"journal_mode = WAL",
+		"synchronous = NORMAL",
+		"busy_timeout = 5000",
 		"temp_store = MEMORY",
 		fmt.Sprintf("cache_size = -%d", writerCacheSizeKB()),
 	}
 }
 
-// defaultReaderPragmas returns the connector-side default PRAGMAs for
-// the reader. (busy_timeout lives in the DSN.) Caller PRAGMAs run
-// after this list.
+// defaultReaderPragmas mirrors defaultWriterPragmas for the reader.
+// busy_timeout is also carried in readerDSN as a mattn shortcut.
 func defaultReaderPragmas() []string {
 	return []string{
+		"busy_timeout = 5000",
 		"temp_store = MEMORY",
 		fmt.Sprintf("cache_size = -%d", readerCacheSizeKB()),
 		fmt.Sprintf("threads = %d", runtime.NumCPU()),

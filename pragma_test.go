@@ -60,26 +60,38 @@ func TestApplyOptions_MultiGroupAppendOrder(t *testing.T) {
 	)
 }
 
-// TestDefaultReadPragmas_IncludesAllBuiltins verifies that the public
-// snapshot includes every built-in PRAGMA Open applies — even those
-// that now live in the DSN rather than the connector list. Without
-// this, the "spread DefaultReadPragmas to keep defaults" recovery
-// recipe would silently drop busy_timeout (and friends).
-func TestDefaultReadPragmas_IncludesAllBuiltins(t *testing.T) {
+// TestDefaultReadPragmas_MatchesPrivateDefault verifies the public
+// snapshot is byte-for-byte the same list Open applies when no
+// WithReadPRAGMA was given. Mismatches here make user-facing recovery
+// recipes (spread DefaultReadPragmas to keep defaults) silently
+// disagree with Open.
+func TestDefaultReadPragmas_MatchesPrivateDefault(t *testing.T) {
+	assert.Equal(t, defaultReaderPragmas(), DefaultReadPragmas())
+}
+
+// TestDefaultWritePragmas_MatchesPrivateDefault mirrors the reader
+// test for the writer.
+func TestDefaultWritePragmas_MatchesPrivateDefault(t *testing.T) {
+	assert.Equal(t, defaultWriterPragmas(), DefaultWritePragmas())
+}
+
+// TestDefaultReadPragmas_HasFullOptimizedSet guards against silently
+// dropping built-ins: the public snapshot must contain every entry in
+// the originally optimized set (busy_timeout, temp_store, cache_size,
+// threads). Stripping any of them would regress performance or
+// concurrency on the reader pool.
+func TestDefaultReadPragmas_HasFullOptimizedSet(t *testing.T) {
 	all := strings.Join(DefaultReadPragmas(), ", ")
-	// DSN-applied built-ins:
 	assert.Contains(t, all, "busy_timeout = 5000")
-	// Connector-applied built-ins:
 	assert.Contains(t, all, "temp_store = MEMORY")
 	assert.Contains(t, all, "cache_size")
 	assert.Contains(t, all, "threads =")
 }
 
-// TestDefaultWritePragmas_IncludesAllBuiltins mirrors the reader test
-// for the writer, covering the DSN-applied trio (journal_mode,
-// synchronous, busy_timeout) plus the connector pair (temp_store,
-// cache_size).
-func TestDefaultWritePragmas_IncludesAllBuiltins(t *testing.T) {
+// TestDefaultWritePragmas_HasFullOptimizedSet mirrors the reader test
+// for the writer, covering the full optimized writer-side set:
+// journal_mode, synchronous, busy_timeout, temp_store, cache_size.
+func TestDefaultWritePragmas_HasFullOptimizedSet(t *testing.T) {
 	all := strings.Join(DefaultWritePragmas(), ", ")
 	assert.Contains(t, all, "journal_mode = WAL")
 	assert.Contains(t, all, "synchronous = NORMAL")
