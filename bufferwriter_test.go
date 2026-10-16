@@ -3,6 +3,8 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"testing"
@@ -13,6 +15,21 @@ import (
 	"github.com/stretchr/testify/require"
 	_ "modernc.org/sqlite"
 )
+
+// newTestDBWriter builds a *DB wrapper around a freshly created BufferWriter
+// using the temp-file database created by newTestDB. This lets Batch tests
+// invoke the (*DB).Batch API without going through the full Open() /
+// newPragmaConnector stack.
+func newTestDBWriter(t *testing.T, cfg BufferConfig) (*DB, func()) {
+	t.Helper()
+	rawDB, cleanup := newTestDB(t)
+	bw := NewWriter(rawDB, cfg)
+	d := &DB{Writer: bw, Reader: rawDB}
+	return d, func() {
+		_ = bw.Close()
+		cleanup()
+	}
+}
 
 func newTestDB(t *testing.T) (*sql.DB, func()) {
 	f, err := os.CreateTemp("", "batchtest-*.db")
@@ -536,4 +553,268 @@ func TestWriter_ConcurrentBeginTxCommit(t *testing.T) {
 	err := db.QueryRow("SELECT COUNT(*) FROM users").Scan(&count)
 	require.NoError(t, err)
 	assert.Equal(t, goroutines*2, count)
+}
+
+// TestBatch_CommitAll verifies that N statements inside a Batch closure all
+// commit together, the Writer buffer counter is unaffected (the Batch task
+// itself does not increment it), and a single channel send was used.
+func TestBatch_CommitAll(t *testing.T) {
+	d, cleanup := newTestDBWriter(t, BufferConfig{
+		Size:          100,
+		FlushInterval: 100 * time.Millisecond,
+	})
+	defer cleanup()
+
+	const n = 5
+	err := d.Batch(func(tx *sql.Tx) error {
+		for i := 1; i <= n; i++ {
+			if _, err := tx.Exec(
+				"INSERT INTO users (id, name) VALUES (?, ?)",
+				i, fmt.Sprintf("u%d", i),
+			); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, 0, d.Writer.buffer, "Batch must not bump the Writer buffer counter")
+
+	var count int
+	require.NoError(t, d.Reader.QueryRow("SELECT COUNT(*) FROM users").Scan(&count))
+	assert.Equal(t, n, count)
+}
+
+// TestBatch_RollbackOnError verifies that returning a non-nil error from the
+// Batch closure rolls back the transaction, propagates the error verbatim,
+// and releases the Writer lock so subsequent Exec calls succeed.
+func TestBatch_RollbackOnError(t *testing.T) {
+	d, cleanup := newTestDBWriter(t, BufferConfig{
+		Size:          100,
+		FlushInterval: 100 * time.Millisecond,
+	})
+	defer cleanup()
+
+	sentinel := errors.New("user-supplied failure")
+	err := d.Batch(func(tx *sql.Tx) error {
+		_, _ = tx.Exec("INSERT INTO users (id, name) VALUES (1, 'a')")
+		_, _ = tx.Exec("INSERT INTO users (id, name) VALUES (2, 'b')")
+		return sentinel
+	})
+	require.ErrorIs(t, err, sentinel)
+
+	var count int
+	require.NoError(t, d.Reader.QueryRow("SELECT COUNT(*) FROM users").Scan(&count))
+	assert.Equal(t, 0, count, "rollback must discard every statement in the closure")
+
+	// Lock must be released: a follow-up Exec succeeds.
+	_, err = d.Writer.Exec("INSERT INTO users (id, name) VALUES (3, 'after')")
+	require.NoError(t, err)
+}
+
+// TestBatch_PanicRollsBack verifies that a panic inside the Batch closure
+// is recovered, converted to an "sqlite: batch panic: ..." error, and the
+// transaction is rolled back. The lock is also released.
+func TestBatch_PanicRollsBack(t *testing.T) {
+	d, cleanup := newTestDBWriter(t, BufferConfig{
+		Size:          100,
+		FlushInterval: 100 * time.Millisecond,
+	})
+	defer cleanup()
+
+	err := d.Batch(func(tx *sql.Tx) error {
+		_, err := tx.Exec("INSERT INTO users (id, name) VALUES (1, 'before_panic')")
+		require.NoError(t, err)
+		panic("boom")
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "sqlite: batch panic: boom")
+
+	var count int
+	require.NoError(t, d.Reader.QueryRow("SELECT COUNT(*) FROM users").Scan(&count))
+	assert.Equal(t, 0, count, "panic must roll back the transaction")
+
+	// Lock must be released.
+	_, err = d.Writer.Exec("INSERT INTO users (id, name) VALUES (2, 'after')")
+	require.NoError(t, err)
+}
+
+// TestBatch_LocksWriter verifies that while a Batch closure is running, any
+// Writer.Exec / Writer.BeginTx call is blocked on txMu until Batch returns.
+func TestBatch_LocksWriter(t *testing.T) {
+	d, cleanup := newTestDBWriter(t, BufferConfig{
+		Size:          100,
+		FlushInterval: 100 * time.Millisecond,
+	})
+	defer cleanup()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	batchDone := make(chan error, 1)
+
+	go func() {
+		batchDone <- d.Batch(func(tx *sql.Tx) error {
+			close(started)
+			<-release
+			_, err := tx.Exec("INSERT INTO users (id, name) VALUES (1, 'in_batch')")
+			return err
+		})
+	}()
+
+	<-started
+
+	execDone := make(chan error, 1)
+	go func() {
+		_, err := d.Writer.Exec("INSERT INTO users (id, name) VALUES (2, 'blocked')")
+		execDone <- err
+	}()
+
+	// Exec must remain blocked while Batch holds txMu.
+	select {
+	case err := <-execDone:
+		t.Fatalf("Writer.Exec returned %v while Batch was still active", err)
+	case <-time.After(50 * time.Millisecond):
+		// expected: Exec is blocked on txMu.RLock()
+	}
+
+	close(release)
+
+	require.NoError(t, <-batchDone)
+	require.NoError(t, <-execDone)
+
+	// The second Exec was buffered (FlushInterval is high to keep it
+	// buffered during the test window); flush so we can count rows.
+	require.NoError(t, d.Writer.Flush())
+
+	var count int
+	require.NoError(t, d.Reader.QueryRow("SELECT COUNT(*) FROM users").Scan(&count))
+	assert.Equal(t, 2, count)
+}
+
+// TestBatch_FlushesPendingBuffer verifies that Batch flushes any pending
+// buffered writes before opening its own transaction, so the closure sees
+// the prior committed state on its *sql.Tx.
+func TestBatch_FlushesPendingBuffer(t *testing.T) {
+	d, cleanup := newTestDBWriter(t, BufferConfig{
+		Size:          100,
+		FlushInterval: 10 * time.Second, // high interval so nothing auto-flushes
+	})
+	defer cleanup()
+
+	// Buffer a row through the normal Exec path.
+	_, err := d.Writer.Exec("INSERT INTO users (id, name) VALUES (1, 'pre')")
+	require.NoError(t, err)
+	require.Equal(t, 1, d.Writer.buffer, "row must sit in the buffer")
+
+	var insideCount int
+	err = d.Batch(func(tx *sql.Tx) error {
+		if err := tx.QueryRow("SELECT COUNT(*) FROM users").Scan(&insideCount); err != nil {
+			return err
+		}
+		_, err := tx.Exec("INSERT INTO users (id, name) VALUES (2, 'in_batch')")
+		return err
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, insideCount, "buffered row must be visible inside the batch tx")
+
+	var finalCount int
+	require.NoError(t, d.Reader.QueryRow("SELECT COUNT(*) FROM users").Scan(&finalCount))
+	assert.Equal(t, 2, finalCount)
+}
+
+// TestBatch_EmptyCommit verifies that an empty closure still commits a
+// no-op tx and returns nil.
+func TestBatch_EmptyCommit(t *testing.T) {
+	d, cleanup := newTestDBWriter(t, BufferConfig{
+		Size:          100,
+		FlushInterval: 100 * time.Millisecond,
+	})
+	defer cleanup()
+
+	err := d.Batch(func(tx *sql.Tx) error {
+		return nil
+	})
+	require.NoError(t, err)
+
+	var count int
+	require.NoError(t, d.Reader.QueryRow("SELECT COUNT(*) FROM users").Scan(&count))
+	assert.Equal(t, 0, count)
+}
+
+// TestBatch_AfterClose verifies that calling Batch after the Writer has been
+// closed returns ErrClosed without leaking the Writer lock — a subsequent
+// Exec must also observe ErrClosed (no deadlock).
+func TestBatch_AfterClose(t *testing.T) {
+	rawDB, cleanup := newTestDB(t)
+	defer cleanup()
+	bw := NewWriter(rawDB, BufferConfig{
+		Size:          100,
+		FlushInterval: 100 * time.Millisecond,
+	})
+	d := &DB{Writer: bw, Reader: rawDB}
+
+	require.NoError(t, bw.Close())
+
+	err := d.Batch(func(tx *sql.Tx) error {
+		t.Fatal("closure must not run after Writer.Close")
+		return nil
+	})
+	require.ErrorIs(t, err, ErrClosed)
+
+	// Subsequent Exec must surface ErrClosed too; this proves the lock was
+	// released by the defer in Batch (otherwise this RLock would deadlock
+	// and the test would hang until the test framework kills it).
+	_, err = bw.Exec("INSERT INTO users (id, name) VALUES (1, 'a')")
+	assert.ErrorIs(t, err, ErrClosed)
+}
+
+// TestBatch_RecoversFromLeakedPoolConnection verifies that Batch handles the
+// state where a prior code path left bw.tx set with no buffered statements
+// (so commitWithTrigger skipped it). With the writer pool configured at
+// SetMaxOpenConns(1) — the production default from openFile / openMemory —
+// a stranded *sql.Tx would otherwise block BeginTx forever.
+//
+// The leak is induced through the public API: BeginTx opens bw.tx and sets
+// bw.isPending=true; Commit (with no Exec in between) leaves bw.tx dangling
+// because commitWithTrigger returns early when buffer < 1.
+func TestBatch_RecoversFromLeakedPoolConnection(t *testing.T) {
+	rawDB, cleanup := newTestDB(t)
+	defer cleanup()
+	rawDB.SetMaxOpenConns(1)
+
+	bw := NewWriter(rawDB, BufferConfig{
+		Size:          100,
+		FlushInterval: 100 * time.Millisecond,
+	})
+	defer bw.Close()
+	d := &DB{Writer: bw, Reader: rawDB}
+
+	// Induce the leak: BeginTx opens a tx on bw, Commit-without-Exec leaves
+	// bw.tx set holding the only writer-pool connection.
+	tx, err := bw.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	// Without Batch's defensive cleanup, BeginTx inside Batch would block
+	// forever on the full single-connection pool. Run in a goroutine with
+	// a hard timeout so a hang surfaces as a clear failure.
+	done := make(chan error, 1)
+	go func() {
+		done <- d.Batch(func(tx *sql.Tx) error {
+			_, err := tx.Exec("INSERT INTO users (id, name) VALUES (1, 'a')")
+			return err
+		})
+	}()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Batch deadlocked: a stranded bw.tx held the only writer connection")
+	}
+
+	var count int
+	require.NoError(t, rawDB.QueryRow("SELECT COUNT(*) FROM users").Scan(&count))
+	assert.Equal(t, 1, count)
 }

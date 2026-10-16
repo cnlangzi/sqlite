@@ -8,6 +8,7 @@ const (
 	ActionBegin
 	ActionCommit
 	ActionRollback
+	ActionBatch
 )
 
 // TaskFunc is the interface implemented by tasks submitted to the Writer.
