@@ -16,7 +16,12 @@ import (
 // writer connections. The file is created with mode 0666 if it does not exist.
 // The writer uses WAL journal mode for improved concurrency; the reader is
 // configured for read-only, concurrent access.
-func openFile(ctx context.Context, dsn string) (*DB, error) {
+//
+// Optional Option arguments customize the reader and writer connections
+// (see WithReadPRAGMA / WithWritePRAGMA).
+func openFile(ctx context.Context, dsn string, opts []Option) (*DB, error) {
+	cfg := applyOptions(opts)
+
 	_, err := os.Stat(dsn)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -28,13 +33,14 @@ func openFile(ctx context.Context, dsn string) (*DB, error) {
 		}
 	}
 
-	writerDB, err := openWriterDB(dsn)
+	writerDB, err := openWriterDB(ctx, dsn, cfg)
 	if err != nil {
 		return nil, err
 	}
 
-	readerDB, err := openReaderDB(dsn)
+	readerDB, err := openReaderDB(ctx, dsn, cfg)
 	if err != nil {
+		_ = writerDB.Close()
 		return nil, err
 	}
 
@@ -50,11 +56,17 @@ func openFile(ctx context.Context, dsn string) (*DB, error) {
 // openWriterDB opens a single-connection *sql.DB for the writer.
 // Only one connection is used because SQLite requires serialized write access;
 // a single connection naturally serializes all writes without additional locking.
-func openWriterDB(dsn string) (*sql.DB, error) {
-	d, err := sql.Open("sqlite3", writerDSN(dsn))
-	if err != nil {
-		return nil, err
+//
+// cfg governs which PRAGMA list runs at every Connect (per
+// newPragmaConnector): cfg.writerPragmas if cfg.writerProvided is true,
+// otherwise defaultWriterPragmas(). Replace semantics — see
+// WithWritePRAGMA for details.
+func openWriterDB(ctx context.Context, dsn string, cfg *options) (*sql.DB, error) {
+	pragmas := cfg.writerPragmas
+	if !cfg.writerProvided {
+		pragmas = defaultWriterPragmas()
 	}
+	d := sql.OpenDB(newPragmaConnector(writerDSN(dsn), pragmas))
 
 	// Single connection serializes all writes.
 	d.SetMaxOpenConns(1)
@@ -62,6 +74,7 @@ func openWriterDB(dsn string) (*sql.DB, error) {
 	d.SetConnMaxLifetime(0)
 
 	if err := d.Ping(); err != nil {
+		_ = d.Close()
 		return nil, err
 	}
 
@@ -70,11 +83,17 @@ func openWriterDB(dsn string) (*sql.DB, error) {
 
 // openReaderDB opens a connection pool *sql.DB optimized for concurrent reads.
 // The pool size scales with CPU count to maximize read throughput.
-func openReaderDB(dsn string) (*sql.DB, error) {
-	d, err := sql.Open("sqlite3", readerDSN(dsn))
-	if err != nil {
-		return nil, err
+//
+// cfg governs which PRAGMA list runs at every Connect (per
+// newPragmaConnector): cfg.readerPragmas if cfg.readerProvided is true,
+// otherwise defaultReaderPragmas(). The pragmaConnector guarantees every
+// pool connection — initial and replacement — gets the chosen PRAGMAs.
+func openReaderDB(ctx context.Context, dsn string, cfg *options) (*sql.DB, error) {
+	pragmas := cfg.readerPragmas
+	if !cfg.readerProvided {
+		pragmas = defaultReaderPragmas()
 	}
+	d := sql.OpenDB(newPragmaConnector(readerDSN(dsn), pragmas))
 
 	// Scale reader pool with CPU count.
 	conns := max(10, runtime.NumCPU()*2)
@@ -83,39 +102,77 @@ func openReaderDB(dsn string) (*sql.DB, error) {
 	d.SetConnMaxLifetime(0)
 
 	if err := d.Ping(); err != nil {
+		_ = d.Close()
 		return nil, err
 	}
 
 	return d, nil
 }
 
-// writerDSN constructs a SQLite DSN for the writer connection with
-// mode=rwc (read-write-create), WAL journal mode, and pragmas tuned for
-// write performance and reliability. The negative cache_size value indicates
-// KiB rather than pages.
+// writerDSN constructs a SQLite DSN for the writer connection. It
+// carries connection-open settings that mattn exposes as first-class
+// DSN keys (mode, journal_mode, synchronous, busy_timeout) so the
+// driver applies them at Open time, ahead of the connector. PRAGMAs
+// without a mattn DSN form (temp_store, cache_size) flow through the
+// pragmaConnector instead. Caller PRAGMAs run after the connector's
+// built-ins and so can override same-name DSN-level values via
+// last-write-wins.
 func writerDSN(file string) string {
 	params := url.Values{}
 	params.Add("mode", "rwc")
 	params.Add("_journal_mode", "WAL")
 	params.Add("_synchronous", "NORMAL")
 	params.Add("_busy_timeout", "5000")
-	params.Add("_pragma", "temp_store(MEMORY)")
-	params.Add("_pragma", fmt.Sprintf("cache_size(-%d)", writerCacheSizeKB()))
 	return file + "?" + params.Encode()
 }
 
-// readerDSN constructs a SQLite DSN for the reader connection with mode=ro
-// (read-only) and pragmas tuned for read performance, including private cache
-// to avoid cache synchronization overhead and thread count matching CPU count for parallel queries.
+// readerDSN constructs a SQLite DSN for the reader connection with
+// mode=ro and the mattn-exposed busy_timeout. Other PRAGMAs flow
+// through the pragmaConnector, see writerDSN for the rationale.
 func readerDSN(file string) string {
 	params := url.Values{}
 	params.Add("mode", "ro")
-	params.Add("cache", "private")
 	params.Add("_busy_timeout", "5000")
-	params.Add("_pragma", "temp_store(MEMORY)")
-	params.Add("_pragma", fmt.Sprintf("cache_size(-%d)", readerCacheSizeKB()))
-	params.Add("_pragma", fmt.Sprintf("threads(%d)", runtime.NumCPU()))
 	return file + "?" + params.Encode()
+}
+
+// defaultWriterPragmas returns the full built-in writer PRAGMA list
+// (the canonical optimized set), evaluated at call time — cache_size
+// depends on host memory. Open applies this list end-to-end:
+//
+//  1. mattn-applied subset: journal_mode, synchronous, busy_timeout
+//     are also expressed as mattn DSN keys in writerDSN, so the driver
+//     applies them at connection-open time.
+//  2. pragmaConnector at every Connect: this same list is run as
+//     PRAGMA statements. Caller-supplied PRAGMAs come after, so a
+//     same-name caller PRAGMA wins via SQLite's last-write-wins.
+//
+// The dual application is harmless — every PRAGMA in step 1 is
+// idempotent under SQLite, so running it twice in step 2 produces the
+// same end state as running it once.
+//
+// Ordering: action-style PRAGMAs (journal_mode, synchronous,
+// busy_timeout, temp_store) run before the cache is sized, because
+// cache_size depends on the connection state being stable.
+func defaultWriterPragmas() []string {
+	return []string{
+		"journal_mode = WAL",
+		"synchronous = NORMAL",
+		"busy_timeout = 5000",
+		"temp_store = MEMORY",
+		fmt.Sprintf("cache_size = -%d", writerCacheSizeKB()),
+	}
+}
+
+// defaultReaderPragmas mirrors defaultWriterPragmas for the reader.
+// busy_timeout is also carried in readerDSN as a mattn shortcut.
+func defaultReaderPragmas() []string {
+	return []string{
+		"busy_timeout = 5000",
+		"temp_store = MEMORY",
+		fmt.Sprintf("cache_size = -%d", readerCacheSizeKB()),
+		fmt.Sprintf("threads = %d", runtime.NumCPU()),
+	}
 }
 
 // availableMemoryKB returns the currently available memory of the system in KiB
@@ -188,4 +245,3 @@ func readerCacheSizeKB() int64 {
 	}
 	return target
 }
-
