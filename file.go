@@ -109,50 +109,53 @@ func openReaderDB(ctx context.Context, dsn string, cfg *options) (*sql.DB, error
 	return d, nil
 }
 
-// writerDSN constructs a SQLite DSN for the writer connection with
-// mode=rwc (read-write-create). Only connection-open settings that
-// cannot be expressed as a PRAGMA statement live here; every actual
-// PRAGMA (journal_mode, synchronous, busy_timeout, temp_store,
-// cache_size) is applied via the pragmaConnector on every Connect.
+// writerDSN constructs a SQLite DSN for the writer connection. It
+// carries connection-open settings that mattn exposes as first-class
+// DSN keys (mode, journal_mode, synchronous, busy_timeout) so the
+// driver applies them at Open time, ahead of the connector. PRAGMAs
+// without a mattn DSN form (temp_store, cache_size) flow through the
+// pragmaConnector instead. Caller PRAGMAs run after the connector's
+// built-ins and so can override same-name DSN-level values via
+// last-write-wins.
 func writerDSN(file string) string {
 	params := url.Values{}
 	params.Add("mode", "rwc")
+	params.Add("_journal_mode", "WAL")
+	params.Add("_synchronous", "NORMAL")
+	params.Add("_busy_timeout", "5000")
 	return file + "?" + params.Encode()
 }
 
-// readerDSN constructs a SQLite DSN for the reader connection.
-// mode=ro is the only DSN-level setting because it is the connection's
-// open mode (not a PRAGMA); every PRAGMA is applied via the
-// pragmaConnector, see writerDSN for the rationale.
+// readerDSN constructs a SQLite DSN for the reader connection with
+// mode=ro and the mattn-exposed busy_timeout. Other PRAGMAs flow
+// through the pragmaConnector, see writerDSN for the rationale.
 func readerDSN(file string) string {
 	params := url.Values{}
 	params.Add("mode", "ro")
+	params.Add("_busy_timeout", "5000")
 	return file + "?" + params.Encode()
 }
 
-// defaultWriterPragmas returns the built-in writer PRAGMA spec list
-// evaluated at call time (cache_size depends on host memory). The list
-// is the single source of truth that DefaultWritePragmas publicly
-// surfaces; both openFile and call sites read from this helper.
+// defaultWriterPragmas returns the connector-side default PRAGMAs for
+// the writer — those mattn does NOT expose as first-class DSN keys.
+// (journal_mode, synchronous, busy_timeout live in the DSN; see
+// writerDSN.) Caller-supplied PRAGMAs run after this list, so a
+// same-name caller PRAGMA wins via SQLite's last-write-wins.
 //
-// Ordering matters: action-style PRAGMAs (journal_mode, synchronous,
-// busy_timeout) run before predicate-style PRAGMAs (cache_size) so the
-// connection state is stable before the cache is sized.
+// Ordering: the cache is sized last because it depends on the
+// journal/synchronous/busy_timeout state already being in place.
 func defaultWriterPragmas() []string {
 	return []string{
-		"journal_mode = WAL",
-		"synchronous = NORMAL",
-		"busy_timeout = 5000",
 		"temp_store = MEMORY",
 		fmt.Sprintf("cache_size = -%d", writerCacheSizeKB()),
 	}
 }
 
-// defaultReaderPragmas returns the built-in reader PRAGMA spec list.
-// DefaultReadPragmas publicly surfaces the same content.
+// defaultReaderPragmas returns the connector-side default PRAGMAs for
+// the reader. (busy_timeout lives in the DSN.) Caller PRAGMAs run
+// after this list.
 func defaultReaderPragmas() []string {
 	return []string{
-		"busy_timeout = 5000",
 		"temp_store = MEMORY",
 		fmt.Sprintf("cache_size = -%d", readerCacheSizeKB()),
 		fmt.Sprintf("threads = %d", runtime.NumCPU()),

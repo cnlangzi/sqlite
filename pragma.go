@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"fmt"
+	"runtime"
 
 	"github.com/mattn/go-sqlite3"
 )
@@ -70,20 +71,41 @@ func WithWritePRAGMA(pragmas ...string) Option {
 	}
 }
 
-// DefaultReadPragmas returns a snapshot of the built-in PRAGMA spec list
-// for the reader connection, evaluated at call time (cache_size and
-// threads depend on the current host). The list is exactly what Open
-// applies when no WithReadPRAGMA was given. Useful as a baseline that
-// callers can spread through WithReadPRAGMA to recover the defaults
-// after replacement.
+// DefaultReadPragmas returns the full set of reader-side built-in
+// PRAGMAs that Open applies — both those expressed as mattn DSN keys
+// (busy_timeout) and those applied via the pragmaConnector (temp_store,
+// cache_size, threads). Useful as a baseline that callers can spread
+// through WithReadPRAGMA to recover every built-in after replace
+// semantics have kicked in:
+//
+//	sqlite.WithReadPRAGMA(
+//	    "secure_delete = ON",                 // user addition
+//	    sqlite.DefaultReadPragmas()...,        // adopt the package baseline
+//	)
+//
+// Caller-supplied same-name PRAGMAs override the built-in. Same-name
+// PRAGMAs that mattn exposes in both DSN form (busy_timeout) and
+// connector form are equivalent: anything passed via Exec wins for
+// the same name (last-write-wins).
 func DefaultReadPragmas() []string {
-	return defaultReaderPragmas()
+	return []string{
+		"busy_timeout = 5000",
+		"temp_store = MEMORY",
+		fmt.Sprintf("cache_size = -%d", readerCacheSizeKB()),
+		fmt.Sprintf("threads = %d", runtime.NumCPU()),
+	}
 }
 
-// DefaultWritePragmas returns a snapshot of the built-in PRAGMA spec list
-// for the writer connection. See DefaultReadPragmas for usage notes.
+// DefaultWritePragmas returns the full set of writer-side built-in
+// PRAGMAs. See DefaultReadPragmas for usage notes.
 func DefaultWritePragmas() []string {
-	return defaultWriterPragmas()
+	return []string{
+		"journal_mode = WAL",
+		"synchronous = NORMAL",
+		"busy_timeout = 5000",
+		"temp_store = MEMORY",
+		fmt.Sprintf("cache_size = -%d", writerCacheSizeKB()),
+	}
 }
 
 // applyOptions runs each option against a freshly allocated options
@@ -128,31 +150,48 @@ func newPragmaConnector(dsn string, pragmas []string) driver.Connector {
 	}
 }
 
-// Connect opens a new SQLite connection via the wrapped driver and
-// applies the configured PRAGMA list in declaration order. Errors close
-// the partially-opened connection so the caller does not have to clean
-// up. nil/empty pragma lists fast-path: the connection is returned as
-// soon as the driver opens it.
+// Connect is invoked by database/sql every time it needs a brand-new
+// physical SQLite connection — that includes the initial lazy open on
+// first use, pool growth past the initial set, and replacements after
+// ErrBadConn / idle eviction. Each call therefore corresponds to a
+// connection that has no PRAGMA state we set, so the list has to be
+// re-applied here. (Doing it once at the top-level sql.Open call would
+// only cover the warm-up conn and silently regress every replacement to
+// driver defaults — busy_timeout=5000, synchronous=NORMAL, no
+// temp_store / cache_size / threads / caller overrides.)
+//
+// On success the connection is returned to database/sql and lives until
+// the pool decides to discard it. The Close calls in the error paths
+// release the half-open handle when Open or a PRAGMA application fails.
 func (c *pragmaConnector) Connect(ctx context.Context) (driver.Conn, error) {
 	conn, err := c.driver.Open(c.dsn)
 	if err != nil {
 		return nil, err
 	}
+	if err := c.applyPragmas(ctx, conn); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+// applyPragmas runs the configured PRAGMA list on an already-open
+// connection. An empty list short-circuits so connect-only callers (no
+// PRAGMAs wanted) pay no ExecerContext check or per-statement exec.
+func (c *pragmaConnector) applyPragmas(ctx context.Context, conn driver.Conn) error {
 	if len(c.pragmas) == 0 {
-		return conn, nil
+		return nil
 	}
 	exec, ok := conn.(driver.ExecerContext)
 	if !ok {
-		_ = conn.Close()
-		return nil, fmt.Errorf("pragmaConnector: driver.Conn does not implement driver.ExecerContext")
+		return fmt.Errorf("pragmaConnector: driver.Conn %T does not implement driver.ExecerContext", conn)
 	}
 	for _, p := range c.pragmas {
 		if _, err := exec.ExecContext(ctx, "PRAGMA "+p, nil); err != nil {
-			_ = conn.Close()
-			return nil, fmt.Errorf("pragmaConnector: apply PRAGMA %q: %w", p, err)
+			return fmt.Errorf("pragmaConnector: apply PRAGMA %q: %w", p, err)
 		}
 	}
-	return conn, nil
+	return nil
 }
 
 // Driver returns the underlying mattn SQLiteDriver. Required by the
