@@ -19,7 +19,6 @@ import (
 	"database/sql"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -483,12 +482,12 @@ func TestBatch_Query_MixedReadWriteStress(t *testing.T) {
 		}
 
 		// Reader goroutines: cycle through every Query* API.
-		var readIters int64
 		for r := 0; r < readerG; r++ {
 			wg.Add(1)
 			go func(r int) {
 				defer wg.Done()
 				ctx := context.Background()
+				var prev int // for monotonicity sanity check
 				for i := 0; i < readN; i++ {
 					var n int
 					var err error
@@ -528,9 +527,15 @@ func TestBatch_Query_MixedReadWriteStress(t *testing.T) {
 						t.Errorf("reader %d iter %d: %v", r, i, err)
 						return
 					}
-					// Sanity bound — the count must monotonically
-					// non-decrease across this goroutine's reads.
-					atomic.AddInt64(&readIters, 1)
+					// Sanity bound — across this goroutine's reads the
+					// committed row count may only stay flat or grow.
+					if n < prev {
+						t.Errorf(
+							"reader %d iter %d: count went from %d to %d (non-monotonic)",
+							r, i, prev, n)
+						return
+					}
+					prev = n
 				}
 			}(r)
 		}

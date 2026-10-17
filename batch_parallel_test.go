@@ -345,7 +345,9 @@ func TestBatch_ParallelInsert_RollbackIsolated(t *testing.T) {
 				}
 				return sentinel
 			})
-			require.ErrorIs(t, err, sentinel)
+			if !errors.Is(err, sentinel) {
+				t.Errorf("failing batch returned %v, want %v", err, sentinel)
+			}
 		}()
 
 		// Successful Batches.
