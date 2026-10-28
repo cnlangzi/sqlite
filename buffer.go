@@ -31,23 +31,32 @@ type BufferConfig struct {
 // reading from the SQLITE_BUFFER_SIZE, SQLITE_BUFFER_FLUSH_INTERVAL and
 // SQLITE_BUFFER_QUEUE_CAPACITY env vars when set. Call this at Open time to
 // respect environment configuration.
+//
+// An env value that cannot be parsed, or that is not positive, is ignored
+// and the corresponding default is kept.
 func DefaultBufferConfig() BufferConfig {
 	cfg := BufferConfig{Size: 100, FlushInterval: 100 * time.Millisecond, QueueCapacity: 100}
-	if v := os.Getenv("SQLITE_BUFFER_SIZE"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			cfg.Size = n
+
+	for _, e := range []struct {
+		env  string
+		dest *int
+	}{
+		{"SQLITE_BUFFER_SIZE", &cfg.Size},
+		{"SQLITE_BUFFER_QUEUE_CAPACITY", &cfg.QueueCapacity},
+	} {
+		if v := os.Getenv(e.env); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				*e.dest = n
+			}
 		}
 	}
+
 	if v := os.Getenv("SQLITE_BUFFER_FLUSH_INTERVAL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			cfg.FlushInterval = d
 		}
 	}
-	if v := os.Getenv("SQLITE_BUFFER_QUEUE_CAPACITY"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			cfg.QueueCapacity = n
-		}
-	}
+
 	return cfg
 }
 
