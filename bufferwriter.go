@@ -165,7 +165,10 @@ func (bw *BufferWriter) waitSingal() {
 func (bw *BufferWriter) Flush() error {
 	bw.txMu.RLock()
 	defer bw.txMu.RUnlock()
-	slog.Debug("flush requested", slog.Int("buffer", bw.buffer))
+	// bw.buffer is owned by the flush goroutine, which increments and resets
+	// it. Reading it here would race with the goroutine's commit, so the
+	// count is only logged there (see the "committed" entry).
+	slog.Debug("flush requested")
 
 	task, err := bw.do(Commit())
 
@@ -221,7 +224,8 @@ func (bw *BufferWriter) do(task TaskFunc) (chan TaskResult, error) {
 	case <-bw.done:
 		return nil, ErrClosed
 	default:
-		slog.Warn("task blocked", slog.Int("buffer", bw.buffer))
+		// bw.buffer is owned by the flush goroutine; see Flush().
+		slog.Warn("task blocked")
 		return nil, ErrClosed
 	}
 }

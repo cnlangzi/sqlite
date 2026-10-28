@@ -183,6 +183,61 @@ func TestWriter_DirectExec_TimeBased(t *testing.T) {
 	})
 }
 
+// TestWriter_FlushConcurrentWithIntervalCommit verifies that Flush() is safe
+// to call while the background goroutine commits on its own timer. The buffer
+// counter belongs to the flush goroutine, which resets it when it commits, so
+// the caller's goroutine must not read it. Under -race this test fails if
+// Flush() reads the counter.
+func TestWriter_FlushConcurrentWithIntervalCommit(t *testing.T) {
+	db, cleanup := newTestDB(t)
+	defer cleanup()
+
+	bw := NewWriter(db, BufferConfig{
+		Size:          100, // high threshold: commits come from the timer
+		FlushInterval: 10 * time.Millisecond,
+	})
+	defer bw.Close()
+
+	for i := 0; i < 20; i++ {
+		_, err := bw.Exec("INSERT INTO users (id, name) VALUES (?, 'x')", i+1)
+		require.NoError(t, err)
+
+		// Let the interval trigger commit on the flush goroutine, then flush
+		// from this goroutine: both touch the buffer counter.
+		time.Sleep(20 * time.Millisecond)
+		require.NoError(t, bw.Flush())
+	}
+}
+
+// TestWriter_TaskBlockedDoesNotReadBuffer verifies that the queue-full path of
+// do() does not read the buffer counter on the caller's goroutine: the flush
+// goroutine may be incrementing it at the same time. Under -race this test
+// fails if do() reads the counter.
+func TestWriter_TaskBlockedDoesNotReadBuffer(t *testing.T) {
+	db, cleanup := newTestDB(t)
+	defer cleanup()
+
+	// A single-slot task queue makes the queue-full path reachable.
+	bw := &BufferWriter{
+		DB:     db,
+		cfg:    BufferConfig{Size: 100, FlushInterval: 100 * time.Second},
+		tasks:  make(chan TaskFunc, 1),
+		close:  make(chan struct{}, 1),
+		done:   make(chan struct{}),
+		buffer: 0,
+	}
+	go bw.waitSingal()
+	defer bw.Close()
+
+	for i := 0; i < 100; i++ {
+		// Occupy the only slot so the next do() takes its default branch.
+		bw.tasks <- Exec("INSERT INTO users (id, name) VALUES (?, 'x')", i+1)
+
+		// ErrClosed is returned when the queue is full and the task is rejected.
+		_, _ = bw.Exec("INSERT INTO users (id, name) VALUES (?, 'y')", i+101)
+	}
+}
+
 func TestWriter_DirectExec_Concurrent(t *testing.T) {
 	db, cleanup := newTestDB(t)
 	defer cleanup()
