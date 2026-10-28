@@ -1080,3 +1080,54 @@ func TestBatch_RecoversFromLeakedPoolConnection(t *testing.T) {
 	require.NoError(t, rawDB.QueryRow("SELECT COUNT(*) FROM users").Scan(&count))
 	assert.Equal(t, 1, count)
 }
+
+// execWithinTimeout runs a writer statement in a goroutine and fails the test
+// if it does not return in time. A write that blocks means the writer's
+// exclusive lock was leaked, which would otherwise hang the whole test binary
+// instead of reporting a failure.
+func execWithinTimeout(t *testing.T, bw *BufferWriter, query string, args ...any) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		_, err := bw.Exec(query, args...)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatal("bw.Exec blocked: the writer lock was not released")
+		return nil
+	}
+}
+
+// TestWriter_Tx_CommitFailureReleasesWriterLock verifies that a Tx whose
+// commit fails still releases the writer's exclusive lock. Without the
+// release, the writer is wedged: every later write blocks forever on the
+// lock and the flush goroutine sits idle with nothing to do.
+func TestWriter_Tx_CommitFailureReleasesWriterLock(t *testing.T) {
+	db, cleanup := newTestDB(t)
+	defer cleanup()
+
+	bw := NewWriter(db, BufferConfig{
+		Size:          10,
+		FlushInterval: 10 * time.Second,
+	})
+
+	tx, err := bw.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	_, err = tx.Exec("INSERT INTO users (id, name) VALUES (1, 'a')")
+	require.NoError(t, err)
+
+	// Close the writer so the commit task cannot be submitted any more.
+	require.NoError(t, bw.Close())
+
+	// The commit fails, but the writer lock must be released anyway.
+	err = tx.Commit()
+	assert.ErrorIs(t, err, ErrClosed)
+
+	// The next write must not block on the writer lock.
+	err = execWithinTimeout(t, bw, "INSERT INTO users (id, name) VALUES (2, 'b')")
+	assert.ErrorIs(t, err, ErrClosed)
+}
