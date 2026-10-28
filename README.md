@@ -178,6 +178,25 @@ func (btx *Tx) Commit() error
 func (btx *Tx) Rollback() error
 ```
 
+`Tx.Commit` and `Tx.Rollback` release the writer's exclusive lock on every
+path — a successful commit, a commit that could not be submitted, a commit
+that failed, and a rollback. The lock is released exactly once, so a
+`Rollback` after a failed `Commit` is a no-op that does not release it again.
+
+A failed commit returns the underlying SQLite error unchanged, drops the
+failed transaction and leaves the writer usable: the next statement runs in a
+fresh transaction and commits normally. Only the statements of the failed
+transaction are lost — SQLite has already rolled them back.
+
+If the commit task cannot be submitted at all — the writer is closed, or its
+queue is full (`ErrQueueFull`) — the commit never ran: the transaction stays
+open in the writer and its statements are committed by the next `Flush`,
+`BeginTx` or `Close`. The size- and interval-triggered auto-commits stay
+disabled until then, because the writer still holds that transaction.
+
+A `Tx` that is never finished with `Commit` or `Rollback` holds the writer
+lock for the writer's lifetime, so it must always be finished.
+
 ### Savepoint
 
 For fine-grained transaction control within a batch:

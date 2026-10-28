@@ -48,6 +48,32 @@ func newTestDB(t *testing.T) (*sql.DB, func()) {
 	}
 }
 
+// newFKTestDB builds a temp-file database with foreign keys enabled and a
+// deferred foreign-key constraint, so that a commit can be made to fail
+// deterministically: the INSERT into child succeeds, and the constraint
+// violation is reported when the transaction is committed.
+//
+// The parent table has no foreign-key constraint, so it can be used to check
+// that the writer is still usable after a failed commit.
+func newFKTestDB(t *testing.T) (*sql.DB, func()) {
+	t.Helper()
+	f, err := os.CreateTemp("", "fktest-*.db")
+	require.NoError(t, err)
+	f.Close()
+
+	db, err := sql.Open("sqlite3", f.Name()+"?_journal_mode=WAL&_synchronous=OFF&_foreign_keys=on")
+	require.NoError(t, err)
+	_, err = db.Exec("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+	require.NoError(t, err)
+	_, err = db.Exec("CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)")
+	require.NoError(t, err)
+
+	return db, func() {
+		db.Close()
+		os.Remove(f.Name())
+	}
+}
+
 func TestWriter_DirectExec_SizeBased(t *testing.T) {
 	db, cleanup := newTestDB(t)
 	defer cleanup()
@@ -1079,4 +1105,326 @@ func TestBatch_RecoversFromLeakedPoolConnection(t *testing.T) {
 	var count int
 	require.NoError(t, rawDB.QueryRow("SELECT COUNT(*) FROM users").Scan(&count))
 	assert.Equal(t, 1, count)
+}
+
+// execWithinTimeout runs a writer statement in a goroutine and fails the test
+// if it does not return in time. A write that blocks means the writer's
+// exclusive lock was leaked, which would otherwise hang the whole test binary
+// instead of reporting a failure.
+func execWithinTimeout(t *testing.T, bw *BufferWriter, query string, args ...any) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		_, err := bw.Exec(query, args...)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatal("bw.Exec blocked: the writer lock was not released")
+		return nil
+	}
+}
+
+// TestWriter_Tx_CommitFailureReleasesWriterLock verifies that a Tx whose
+// commit fails still releases the writer's exclusive lock. Without the
+// release, the writer is wedged: every later write blocks forever on the
+// lock and the flush goroutine sits idle with nothing to do.
+func TestWriter_Tx_CommitFailureReleasesWriterLock(t *testing.T) {
+	db, cleanup := newTestDB(t)
+	defer cleanup()
+
+	bw := NewWriter(db, BufferConfig{
+		Size:          10,
+		FlushInterval: 10 * time.Second,
+	})
+
+	tx, err := bw.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	_, err = tx.Exec("INSERT INTO users (id, name) VALUES (1, 'a')")
+	require.NoError(t, err)
+
+	// Close the writer so the commit task cannot be submitted any more.
+	require.NoError(t, bw.Close())
+
+	// The commit fails, but the writer lock must be released anyway.
+	err = tx.Commit()
+	assert.ErrorIs(t, err, ErrClosed)
+
+	// The next write must not block on the writer lock.
+	err = execWithinTimeout(t, bw, "INSERT INTO users (id, name) VALUES (2, 'b')")
+	assert.ErrorIs(t, err, ErrClosed)
+}
+
+// TestWriter_Tx_ReleasesWriterLockExactlyOnce verifies that the writer lock
+// is released exactly once, no matter how the transaction was finished. A
+// second release would panic with "sync: Unlock of unlocked RWMutex".
+func TestWriter_Tx_ReleasesWriterLockExactlyOnce(t *testing.T) {
+	t.Run("commit failed", func(t *testing.T) {
+		db, cleanup := newFKTestDB(t)
+		defer cleanup()
+
+		bw := NewWriter(db, BufferConfig{
+			Size:          10,
+			FlushInterval: 10 * time.Second,
+		})
+		defer bw.Close()
+
+		tx, err := bw.BeginTx(context.Background(), nil)
+		require.NoError(t, err)
+
+		// A deferred foreign-key violation: the statement succeeds, the
+		// commit fails.
+		_, err = tx.Exec("INSERT INTO child (id, parent_id) VALUES (1, 999)")
+		require.NoError(t, err)
+
+		err = tx.Commit()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "FOREIGN KEY constraint failed")
+
+		// The rollback after the failed commit is a no-op and must not
+		// release the lock a second time.
+		require.NotPanics(t, func() {
+			err = tx.Rollback()
+		})
+		require.NoError(t, err)
+
+		// The writer is still usable: the lock was released exactly once.
+		err = execWithinTimeout(t, bw, "INSERT INTO parent (id) VALUES (1)")
+		require.NoError(t, err)
+		require.NoError(t, bw.Flush())
+	})
+
+	t.Run("commit succeeded", func(t *testing.T) {
+		db, cleanup := newTestDB(t)
+		defer cleanup()
+
+		bw := NewWriter(db, BufferConfig{
+			Size:          10,
+			FlushInterval: 10 * time.Second,
+		})
+		defer bw.Close()
+
+		tx, err := bw.BeginTx(context.Background(), nil)
+		require.NoError(t, err)
+		_, err = tx.Exec("INSERT INTO users (id, name) VALUES (1, 'a')")
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit())
+
+		require.NotPanics(t, func() {
+			err = tx.Rollback()
+		})
+		require.NoError(t, err)
+
+		err = execWithinTimeout(t, bw, "INSERT INTO users (id, name) VALUES (2, 'b')")
+		require.NoError(t, err)
+		require.NoError(t, bw.Flush())
+	})
+}
+
+// TestWriter_FailedTxCommitDiscardsTransaction verifies that a failed commit
+// does not leave the writer holding the finished transaction, and that the
+// writer stays usable afterwards.
+func TestWriter_FailedTxCommitDiscardsTransaction(t *testing.T) {
+	db, cleanup := newFKTestDB(t)
+	defer cleanup()
+
+	bw := NewWriter(db, BufferConfig{
+		Size:          10,
+		FlushInterval: 10 * time.Second,
+	})
+	defer bw.Close()
+
+	tx, err := bw.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+
+	_, err = tx.Exec("INSERT INTO child (id, parent_id) VALUES (1, 999)")
+	require.NoError(t, err)
+
+	err = tx.Commit()
+	require.Error(t, err)
+	// The underlying SQLite error is returned unchanged.
+	assert.Contains(t, err.Error(), "FOREIGN KEY constraint failed")
+	assert.NotErrorIs(t, err, sql.ErrTxDone)
+
+	// The finished transaction is dropped, together with the buffered
+	// statement count and the pending flag.
+	assert.Nil(t, bw.tx)
+	assert.Equal(t, 0, bw.buffer)
+	assert.False(t, bw.isPending)
+
+	// The writer stays usable: the next statement runs in a fresh
+	// transaction and commits normally.
+	err = execWithinTimeout(t, bw, "INSERT INTO parent (id) VALUES (1)")
+	require.NoError(t, err)
+	require.NoError(t, bw.Flush())
+
+	var count int
+	require.NoError(t, db.QueryRow("SELECT COUNT(*) FROM parent").Scan(&count))
+	assert.Equal(t, 1, count)
+}
+
+// TestWriter_FailedSizeTriggeredCommitKeepsWriterUsable verifies that a
+// failed size-triggered commit does not leave the writer holding the
+// finished transaction: the next statement must not be rejected with
+// sql.ErrTxDone.
+func TestWriter_FailedSizeTriggeredCommitKeepsWriterUsable(t *testing.T) {
+	db, cleanup := newFKTestDB(t)
+	defer cleanup()
+
+	bw := NewWriter(db, BufferConfig{
+		Size:          1, // commit after every statement
+		FlushInterval: 10 * time.Second,
+	})
+	defer bw.Close()
+
+	// The deferred foreign-key violation is reported when the size-triggered
+	// commit runs, so the statement itself succeeds.
+	_, err := bw.Exec("INSERT INTO child (id, parent_id) VALUES (1, 999)")
+	require.NoError(t, err)
+
+	// The failed transaction is dropped.
+	assert.Nil(t, bw.tx)
+	assert.Equal(t, 0, bw.buffer)
+	assert.False(t, bw.isPending)
+
+	// The next statement runs in a fresh transaction.
+	err = execWithinTimeout(t, bw, "INSERT INTO parent (id) VALUES (1)")
+	require.NoError(t, err)
+	require.NoError(t, bw.Flush())
+
+	var count int
+	require.NoError(t, db.QueryRow("SELECT COUNT(*) FROM parent").Scan(&count))
+	assert.Equal(t, 1, count)
+}
+
+// TestWriter_FailedIntervalTriggeredCommitKeepsWriterUsable verifies that a
+// failed interval-triggered commit does not leave the writer holding the
+// finished transaction.
+func TestWriter_FailedIntervalTriggeredCommitKeepsWriterUsable(t *testing.T) {
+	h, cleanupSlog := resetSlog(t)
+	defer cleanupSlog()
+
+	db, cleanup := newFKTestDB(t)
+	defer cleanup()
+
+	bw := NewWriter(db, BufferConfig{
+		Size:          1000, // never reached
+		FlushInterval: 20 * time.Millisecond,
+	})
+	defer bw.Close()
+
+	_, err := bw.Exec("INSERT INTO child (id, parent_id) VALUES (1, 999)")
+	require.NoError(t, err)
+
+	// Wait for the interval-triggered commit to fail. The writer resets its
+	// transaction before logging the failure, so the log entry also tells the
+	// test that the reset already happened.
+	require.Eventually(t, func() bool {
+		return findEntry(h, "commit failed") != nil
+	}, 5*time.Second, 10*time.Millisecond, "the interval-triggered commit should have failed")
+
+	failed := findEntry(h, "commit failed")
+	require.NotNil(t, failed)
+	assert.Equal(t, "interval", failed.Trigger)
+	// The failure is reported once, by commitWithTrigger.
+	assert.Equal(t, 1, countEntries(h, "commit failed"))
+
+	// The failed transaction is dropped.
+	assert.Nil(t, bw.tx)
+	assert.Equal(t, 0, bw.buffer)
+	assert.False(t, bw.isPending)
+
+	// The next statement runs in a fresh transaction.
+	err = execWithinTimeout(t, bw, "INSERT INTO parent (id) VALUES (1)")
+	require.NoError(t, err)
+	require.NoError(t, bw.Flush())
+
+	var count int
+	require.NoError(t, db.QueryRow("SELECT COUNT(*) FROM parent").Scan(&count))
+	assert.Equal(t, 1, count)
+}
+
+// TestWriter_FailedFlushKeepsWriterUsable verifies that a failed Flush does
+// not leave the writer holding the finished transaction.
+func TestWriter_FailedFlushKeepsWriterUsable(t *testing.T) {
+	db, cleanup := newFKTestDB(t)
+	defer cleanup()
+
+	bw := NewWriter(db, BufferConfig{
+		Size:          1000,
+		FlushInterval: 10 * time.Second,
+	})
+	defer bw.Close()
+
+	_, err := bw.Exec("INSERT INTO child (id, parent_id) VALUES (1, 999)")
+	require.NoError(t, err)
+
+	err = bw.Flush()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "FOREIGN KEY constraint failed")
+
+	// The failed transaction is dropped.
+	assert.Nil(t, bw.tx)
+	assert.Equal(t, 0, bw.buffer)
+	assert.False(t, bw.isPending)
+
+	// The next statement runs in a fresh transaction.
+	err = execWithinTimeout(t, bw, "INSERT INTO parent (id) VALUES (1)")
+	require.NoError(t, err)
+	require.NoError(t, bw.Flush())
+
+	var count int
+	require.NoError(t, db.QueryRow("SELECT COUNT(*) FROM parent").Scan(&count))
+	assert.Equal(t, 1, count)
+}
+
+// TestWriter_Tx_CommitQueueFullReleasesWriterLock verifies that a Tx commit
+// rejected because the task queue is full still releases the writer's
+// exclusive lock, and that the statements of the abandoned transaction are
+// not lost.
+func TestWriter_Tx_CommitQueueFullReleasesWriterLock(t *testing.T) {
+	db, cleanup := newTestDB(t)
+	defer cleanup()
+
+	bw := NewWriter(db, BufferConfig{
+		Size:          100,
+		FlushInterval: 100 * time.Second,
+		QueueCapacity: 1,
+	})
+	defer bw.Close()
+
+	tx, err := bw.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	_, err = tx.Exec("INSERT INTO users (id, name) VALUES (1, 'a')")
+	require.NoError(t, err)
+
+	// Park the flush goroutine so the queue stays full.
+	blocker := newBlockingTask()
+	bw.tasks <- blocker
+	<-blocker.started
+
+	// Occupy the only slot so the commit task is rejected.
+	bw.tasks <- Exec("INSERT INTO users (id, name) VALUES (2, 'b')")
+
+	err = tx.Commit()
+	require.ErrorIs(t, err, ErrQueueFull)
+	assert.NotErrorIs(t, err, ErrClosed)
+
+	// The writer lock must be released: the next write does not block.
+	close(blocker.release)
+	require.Eventually(t, func() bool { return len(bw.tasks) == 0 }, 2*time.Second, 5*time.Millisecond)
+
+	err = execWithinTimeout(t, bw, "INSERT INTO users (id, name) VALUES (3, 'c')")
+	require.NoError(t, err)
+
+	// The commit never ran, so the writer still holds the transaction: its
+	// statements are committed by the next Flush, not lost.
+	require.NoError(t, bw.Flush())
+
+	var count int
+	require.NoError(t, db.QueryRow("SELECT COUNT(*) FROM users").Scan(&count))
+	assert.Equal(t, 3, count)
 }

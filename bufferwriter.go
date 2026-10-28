@@ -86,16 +86,9 @@ func NewWriter(db *sql.DB, cfg BufferConfig) *BufferWriter {
 func (bw *BufferWriter) waitSingal() {
 	timer := time.NewTicker(bw.cfg.FlushInterval)
 	defer func() {
-		if bw.buffer > 0 && bw.tx != nil {
-			err := bw.commitWithTrigger(triggerClose)
-			if err != nil {
-				slog.Error("commit failed",
-					slog.String("trigger", string(triggerClose)),
-					slog.Int("buffer", bw.buffer),
-					slog.String("err", err.Error()))
-			}
-		}
-
+		// Nothing is left to commit on exit: the close path below already
+		// committed the remaining buffer, and a commit that failed discarded
+		// the transaction it belonged to.
 		timer.Stop()
 
 		// closed is also set when the close signal is received, before the
@@ -125,13 +118,9 @@ func (bw *BufferWriter) waitSingal() {
 			}
 		drained:
 			// Commit whatever was already buffered before the close signal.
+			// A failed commit is logged by commitWithTrigger itself.
 			remaining := bw.buffer
-			if err := bw.commitWithTrigger(triggerClose); err != nil {
-				slog.Error("commit failed",
-					slog.String("trigger", string(triggerClose)),
-					slog.Int("buffer", remaining),
-					slog.String("err", err.Error()))
-			} else {
+			if err := bw.commitWithTrigger(triggerClose); err == nil {
 				slog.Info("drained on close", slog.Int("remaining_buffer", remaining))
 			}
 			return // defer handles close(w.done)
@@ -162,12 +151,8 @@ func (bw *BufferWriter) waitSingal() {
 				trigger := triggerSize
 
 				slog.Debug("commit triggered", slog.String("trigger", string(trigger)), slog.Int("buffer", bw.buffer))
-				if err := bw.commitWithTrigger(trigger); err != nil {
-					slog.Error("commit failed",
-						slog.String("trigger", string(trigger)),
-						slog.Int("buffer", bw.buffer),
-						slog.String("err", err.Error()))
-				}
+				// A failed commit is logged by commitWithTrigger itself.
+				_ = bw.commitWithTrigger(trigger)
 
 			}
 
@@ -176,12 +161,8 @@ func (bw *BufferWriter) waitSingal() {
 		case <-timer.C:
 			if bw.buffer > 0 && !bw.isPending && time.Since(bw.lastCommit) >= bw.cfg.FlushInterval {
 				slog.Debug("commit triggered", slog.String("trigger", string(triggerInterval)), slog.Int("buffer", bw.buffer))
-				if err := bw.commitWithTrigger(triggerInterval); err != nil {
-					slog.Error("commit failed",
-						slog.String("trigger", string(triggerInterval)),
-						slog.Int("buffer", bw.buffer),
-						slog.String("err", err.Error()))
-				}
+				// A failed commit is logged by commitWithTrigger itself.
+				_ = bw.commitWithTrigger(triggerInterval)
 			}
 
 		}
@@ -219,9 +200,16 @@ func (bw *BufferWriter) commitWithTrigger(trigger commitTrigger) error {
 	count := bw.buffer
 
 	if err != nil {
+		// The transaction is finished either way: database/sql releases the
+		// connection when Commit fails, and SQLite has already rolled the
+		// transaction back. Drop it, together with the buffered statement
+		// count, so the next statement opens a fresh transaction instead of
+		// failing with ErrTxDone for the rest of the writer's life.
+		bw.discardTx()
+
 		slog.Error("commit failed",
 			slog.String("trigger", string(trigger)),
-			slog.Int("buffer", bw.buffer),
+			slog.Int("buffer", count),
 			slog.String("err", err.Error()))
 
 		return err
@@ -236,6 +224,25 @@ func (bw *BufferWriter) commitWithTrigger(trigger commitTrigger) error {
 		slog.Duration("elapsed", elapsed))
 
 	return nil
+}
+
+// discardTx drops the writer's current transaction. It is used after a failed
+// commit, where the transaction can no longer be used: the buffered statements
+// it held are lost with it.
+//
+// It must only be called from the flush goroutine, which owns bw.tx,
+// bw.buffer and bw.isPending.
+func (bw *BufferWriter) discardTx() {
+	if bw.tx != nil {
+		// No-op when the transaction is already finished, which is the case
+		// when the commit itself failed.
+		_ = bw.tx.Rollback()
+		bw.tx = nil
+	}
+	bw.buffer = 0
+	// A transaction that failed to commit is over: leaving the flag set would
+	// keep the size-triggered commit disabled.
+	bw.isPending = false
 }
 
 // do submits a task to the flush goroutine and returns a channel that
