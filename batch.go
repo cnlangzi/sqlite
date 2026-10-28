@@ -95,7 +95,7 @@ func (bw *BufferWriter) Batch(fn func(*sql.Tx) error) error {
 	if err != nil {
 		return err
 	}
-	return (<-ch).Error
+	return bw.await(ch).Error
 }
 
 // safeBatchCall invokes fn with the given transaction, recovering from any

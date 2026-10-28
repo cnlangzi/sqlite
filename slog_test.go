@@ -24,6 +24,8 @@ type slogEntry struct {
 	Elapsed         string `json:"elapsed,omitempty"`
 	Err             string `json:"err,omitempty"`
 	RemainingBuffer int    `json:"remaining_buffer,omitempty"`
+	Queued          int    `json:"queued,omitempty"`
+	Capacity        int    `json:"capacity,omitempty"`
 }
 
 // testHandler implements slog.Handler for testing.
@@ -69,6 +71,14 @@ func (h *testHandler) Handle(_ context.Context, r slog.Record) error {
 		case "remaining_buffer":
 			if v, ok := a.Value.Any().(int64); ok {
 				entry.RemainingBuffer = int(v)
+			}
+		case "queued":
+			if v, ok := a.Value.Any().(int64); ok {
+				entry.Queued = int(v)
+			}
+		case "capacity":
+			if v, ok := a.Value.Any().(int64); ok {
+				entry.Capacity = int(v)
 			}
 		}
 		return true
@@ -243,34 +253,38 @@ func TestSlog_CloseDrain(t *testing.T) {
 }
 
 func TestSlog_TaskBlocked(t *testing.T) {
-	_, cleanup := resetSlog(t)
+	h, cleanup := resetSlog(t)
 	defer cleanup()
 
 	db, dbCleanup := newTestDB(t)
 	defer dbCleanup()
 
-	// Create writer with tiny task channel to trigger blocking
+	// Create writer with tiny task channel to trigger blocking. No flush
+	// goroutine is started, so the queue stays full for the whole test and
+	// the rejection path is reached deterministically. Close() is therefore
+	// not called: no goroutine would ever close bw.done.
 	bw := &BufferWriter{
 		DB:     db,
-		cfg:    BufferConfig{Size: 100, FlushInterval: 100 * time.Second},
+		cfg:    BufferConfig{Size: 100, FlushInterval: 100 * time.Second, QueueCapacity: 1},
 		tasks:  make(chan TaskFunc, 1), // tiny channel
 		close:  make(chan struct{}, 1),
 		done:   make(chan struct{}),
 		buffer: 0,
 	}
-	go bw.waitSingal()
-	defer bw.Close()
 
-	// First task should succeed
-	_, _ = bw.Exec("INSERT INTO users (id, name) VALUES (1, 'a')")
-	// Might succeed or fail depending on timing
-
-	// Try to fill the channel
+	// Fill the only slot so the next do() takes its default branch.
 	bw.tasks <- Exec("INSERT INTO users (id, name) VALUES (2, 'b')")
-	bw.tasks <- Exec("INSERT INTO users (id, name) VALUES (3, 'c')")
 
-	// Verify task blocked log appears at least once
-	time.Sleep(10 * time.Millisecond)
+	_, err := bw.Exec("INSERT INTO users (id, name) VALUES (3, 'c')")
+	require.ErrorIs(t, err, ErrQueueFull)
+
+	// The task blocked log reports the queue occupancy, not the transaction
+	// buffer: the caller needs to know how saturated the queue is.
+	blocked := findEntry(h, "task blocked")
+	require.NotNil(t, blocked, "should have task blocked log")
+	assert.Equal(t, "WARN", blocked.Level)
+	assert.Equal(t, 1, blocked.Queued)
+	assert.Equal(t, 1, blocked.Capacity)
 }
 
 func TestSlog_TxCommit(t *testing.T) {
