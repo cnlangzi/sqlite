@@ -44,16 +44,28 @@ row.Scan(&name)
 
 ### Buffer Configuration
 
+`Open` / `New` build the writer from `DefaultBufferConfig()`, which reads its
+defaults from the environment:
+
+| Environment variable | Meaning | Default |
+|----------------------|---------|---------|
+| `SQLITE_BUFFER_SIZE` | Statements buffered per transaction before a commit | `100` |
+| `SQLITE_BUFFER_FLUSH_INTERVAL` | Maximum time between commits | `100ms` |
+| `SQLITE_BUFFER_QUEUE_CAPACITY` | Tasks that may wait in the writer's task queue | `100` |
+
+To use a non-default configuration, build the writer yourself with
+`NewWriter`:
+
 ```go
-db, err := sqlite.Open(ctx, "mydb.db")
+db, err := sql.Open("sqlite3", "mydb.db")
 if err != nil {
     log.Fatal(err)
 }
 
-// Customize buffer behavior
-db.Writer.(*sqlite.Writer).Configure(sqlite.Buffer{
-    BufferSize:    200,              // Number of statements before flush (default: 100)
-    FlushInterval: 200 * time.Millisecond, // Maximum wait before flush (default: 100ms)
+writer := sqlite.NewWriter(db, sqlite.BufferConfig{
+    Size:          200,                   // Statements per transaction (default: 100)
+    FlushInterval: 200 * time.Millisecond, // Maximum wait between commits (default: 100ms)
+    QueueCapacity: 500,                   // Tasks that may wait in the task queue (default: 100)
 })
 ```
 
@@ -79,13 +91,14 @@ The `DB` wrapper maintains two separate `*sql.DB` connections:
 
 The `Writer` transparently batches writes through a dedicated goroutine:
 
-1. Writes are sent via a channel to a single flush goroutine
+1. Writes are sent to the writer's task queue (a buffered channel) and picked
+   up by a single flush goroutine
 2. The goroutine collects writes into an in-memory transaction
 3. Flush occurs when:
-   - Buffer reaches `BufferSize` threshold
+   - Buffer reaches the `Size` threshold
    - `FlushInterval` elapses since last commit
-   - `Writer.Commit()` is called
-   - `Writer.Close()` is called
+   - `Flush()` is called
+   - `Close()` is called
 
 ### Automatic Memory Tuning
 
@@ -134,6 +147,18 @@ func (w *Writer) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error)
 // Close the writer (flushes and waits for completion)
 func (w *Writer) Close() error
 ```
+
+### Error Semantics
+
+| Error | Meaning | Caller action |
+|-------|---------|---------------|
+| `sqlite.ErrClosed` | The writer is closed, or was closed while the task was queued | Terminal — stop writing |
+| `sqlite.ErrQueueFull` | The writer's task queue is full; the task was **not** executed | Transient — retry once the queue drains |
+
+`ErrQueueFull` is back-pressure: the flush goroutine is behind, for example
+because it is blocked on a slow statement or on the SQLite write lock. The two
+sentinels are never conflated, so a caller can always tell "retry this write"
+apart from "the writer is dead".
 
 ### Tx (Buffered Transaction)
 
@@ -275,7 +300,7 @@ The package uses `log/slog` for structured logging at key points in the writer/b
 | Info | `committed` | `trigger`, `count`, `elapsed` | Successful commit with duration |
 | Error | `commit failed` | `trigger`, `buffer`, `err` | Commit failure |
 | Debug | `flush requested` | - | Manual Flush() called |
-| Warn | `task blocked` | - | Channel full, task rejected |
+| Warn | `task blocked` | `queued`, `capacity` | Task queue full, task rejected |
 | Info | `close signal received` | - | Close signal received |
 | Info | `drained on close` | `remaining_buffer` | Final commit on close |
 | Debug | `tx committed` | `count` | Buffered Tx committed successfully |
@@ -296,7 +321,7 @@ The package uses `log/slog` for structured logging at key points in the writer/b
 
 - **Debug**: Routine flow (task received, buffered, tx started, commit triggered, flush requested, tx committed/rolled back)
 - **Info**: Meaningful business events (committed, close signal received, drained on close)
-- **Warn**: Backpressure (task blocked)
+- **Warn**: Backpressure (task blocked) — surfaced to callers as `ErrQueueFull`
 - **Error**: Failures (commit failed)
 
 ## Performance Characteristics

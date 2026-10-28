@@ -19,13 +19,20 @@ type BufferConfig struct {
 	// flushes pending statements if this interval elapses since the last
 	// commit, even if Size has not been reached. Default: 100ms.
 	FlushInterval time.Duration
+
+	// QueueCapacity is the number of tasks that may wait in the writer's
+	// task queue for the flush goroutine. When the queue is full, further
+	// tasks are rejected with ErrQueueFull (transient back-pressure)
+	// instead of blocking the caller. Default: 100.
+	QueueCapacity int
 }
 
 // DefaultBufferConfig returns a BufferConfig with defaults applied,
-// reading from SQLITE_BUFFER_SIZE and SQLITE_BUFFER_FLUSH_INTERVAL env vars
-// when set. Call this at Open time to respect environment configuration.
+// reading from the SQLITE_BUFFER_SIZE, SQLITE_BUFFER_FLUSH_INTERVAL and
+// SQLITE_BUFFER_QUEUE_CAPACITY env vars when set. Call this at Open time to
+// respect environment configuration.
 func DefaultBufferConfig() BufferConfig {
-	cfg := BufferConfig{Size: 100, FlushInterval: 100 * time.Millisecond}
+	cfg := BufferConfig{Size: 100, FlushInterval: 100 * time.Millisecond, QueueCapacity: 100}
 	if v := os.Getenv("SQLITE_BUFFER_SIZE"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cfg.Size = n
@@ -34,6 +41,11 @@ func DefaultBufferConfig() BufferConfig {
 	if v := os.Getenv("SQLITE_BUFFER_FLUSH_INTERVAL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			cfg.FlushInterval = d
+		}
+	}
+	if v := os.Getenv("SQLITE_BUFFER_QUEUE_CAPACITY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.QueueCapacity = n
 		}
 	}
 	return cfg
@@ -48,5 +60,8 @@ func (c *BufferConfig) Validate() {
 	}
 	if c.FlushInterval <= 0 {
 		c.FlushInterval = 100 * time.Millisecond
+	}
+	if c.QueueCapacity <= 0 {
+		c.QueueCapacity = 100
 	}
 }

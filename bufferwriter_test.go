@@ -233,10 +233,114 @@ func TestWriter_TaskBlockedDoesNotReadBuffer(t *testing.T) {
 		// Occupy the only slot so the next do() takes its default branch.
 		bw.tasks <- Exec("INSERT INTO users (id, name) VALUES (?, 'x')", i+1)
 
-		// ErrClosed is returned when the queue is full and the task is rejected.
+		// ErrQueueFull is returned when the queue is full and the task is
+		// rejected. The error is discarded here: whether the flush goroutine
+		// has already drained the slot is a race, and the deterministic
+		// assertion lives in TestWriter_QueueFullReturnsErrQueueFull.
 		_, _ = bw.Exec("INSERT INTO users (id, name) VALUES (?, 'y')", i+101)
 	}
 }
+
+// TestWriter_QueueFullReturnsErrQueueFull verifies that a task rejected
+// because the task queue is full reports ErrQueueFull, not ErrClosed. The two
+// conditions are different: ErrClosed is terminal, ErrQueueFull is transient
+// back-pressure that the caller may retry.
+func TestWriter_QueueFullReturnsErrQueueFull(t *testing.T) {
+	db, cleanup := newTestDB(t)
+	defer cleanup()
+
+	// No flush goroutine is started, so the queue stays full for the whole
+	// test and do() deterministically takes its default branch. Close() is
+	// therefore not called: no goroutine would ever close bw.done.
+	bw := &BufferWriter{
+		DB:     db,
+		cfg:    BufferConfig{Size: 100, FlushInterval: 100 * time.Second, QueueCapacity: 1},
+		tasks:  make(chan TaskFunc, 1),
+		close:  make(chan struct{}, 1),
+		done:   make(chan struct{}),
+		buffer: 0,
+	}
+
+	// Fill the only slot so the next do() takes its default branch.
+	bw.tasks <- Exec("INSERT INTO users (id, name) VALUES (?, 'x')", 1)
+
+	_, err := bw.Exec("INSERT INTO users (id, name) VALUES (?, 'y')", 2)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrQueueFull)
+	assert.NotErrorIs(t, err, ErrClosed)
+
+	// The writer itself is not closed: only the queue was full.
+	assert.False(t, bw.closed.Load())
+}
+
+// TestWriter_QueueFullLeavesWriterUsable verifies that a task rejected
+// because the task queue is full does not poison the writer: once the queue
+// drains, the same writer accepts writes and flushes normally.
+func TestWriter_QueueFullLeavesWriterUsable(t *testing.T) {
+	db, cleanup := newTestDB(t)
+	defer cleanup()
+
+	bw := NewWriter(db, BufferConfig{
+		Size:          100,
+		FlushInterval: 100 * time.Second,
+		QueueCapacity: 2,
+	})
+	defer bw.Close()
+
+	// Park the flush goroutine inside a task so nothing drains the queue
+	// while the test fills it.
+	blocker := newBlockingTask()
+	bw.tasks <- blocker
+	<-blocker.started
+
+	// Fill the queue to capacity.
+	bw.tasks <- Exec("INSERT INTO users (id, name) VALUES (?, 'x')", 1)
+	bw.tasks <- Exec("INSERT INTO users (id, name) VALUES (?, 'x')", 2)
+
+	// The queue is full and the flush goroutine is parked, so this write is
+	// rejected deterministically.
+	_, err := bw.Exec("INSERT INTO users (id, name) VALUES (?, 'y')", 3)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrQueueFull)
+	assert.NotErrorIs(t, err, ErrClosed)
+
+	// Let the flush goroutine drain the queue again.
+	close(blocker.release)
+	require.Eventually(t, func() bool { return len(bw.tasks) == 0 }, 2*time.Second, 5*time.Millisecond)
+
+	// The writer is still healthy: the rejection was back-pressure, not a
+	// terminal condition.
+	_, err = bw.Exec("INSERT INTO users (id, name) VALUES (?, 'z')", 4)
+	require.NoError(t, err)
+	require.NoError(t, bw.Flush())
+}
+
+// blockingTask is a TaskFunc whose Exec parks until release is closed. It
+// lets a test hold the flush goroutine inside task.Exec so the task queue can
+// be filled deterministically.
+type blockingTask struct {
+	notify  chan TaskResult
+	started chan struct{}
+	release chan struct{}
+}
+
+func newBlockingTask() *blockingTask {
+	return &blockingTask{
+		notify:  make(chan TaskResult, 1),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (t *blockingTask) Exec(_ *BufferWriter) TaskResult {
+	close(t.started)
+	<-t.release
+	return TaskResult{}
+}
+
+func (t *blockingTask) Notify() chan TaskResult { return t.notify }
+
+func (t *blockingTask) Action() Action { return ActionExec }
 
 func TestWriter_DirectExec_Concurrent(t *testing.T) {
 	db, cleanup := newTestDB(t)

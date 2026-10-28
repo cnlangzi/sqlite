@@ -12,6 +12,18 @@ import (
 
 var ErrClosed = errors.New("sqlite: writer is closed")
 
+// ErrQueueFull is returned when the writer's task queue is full and the
+// submitted task is rejected without being executed.
+//
+// This is transient back-pressure, not a terminal condition: the flush
+// goroutine is behind, for example because it is blocked on a slow statement
+// or on the SQLite write lock. Retrying the same statement is safe once the
+// queue drains.
+//
+// A closed writer is reported as ErrClosed instead; the two conditions are
+// never conflated.
+var ErrQueueFull = errors.New("sqlite: writer task queue is full")
+
 // commitTrigger indicates what caused a commit.
 type commitTrigger string
 
@@ -46,12 +58,14 @@ type BufferWriter struct {
 // NewWriter creates a Writer wrapping the provided *sql.DB.
 // The returned Writer starts a background flush goroutine immediately.
 // Close must be called to shut it down cleanly.
+//
+// The task queue is sized from cfg.QueueCapacity; see BufferConfig.
 func NewWriter(db *sql.DB, cfg BufferConfig) *BufferWriter {
 	cfg.Validate()
 	w := &BufferWriter{
 		DB:     db,
 		cfg:    cfg,
-		tasks:  make(chan TaskFunc, 100),
+		tasks:  make(chan TaskFunc, cfg.QueueCapacity),
 		close:  make(chan struct{}, 1),
 		done:   make(chan struct{}),
 		buffer: 0,
@@ -213,7 +227,11 @@ func (bw *BufferWriter) commitWithTrigger(trigger commitTrigger) error {
 }
 
 // do submits a task to the flush goroutine and returns a channel that
-// receives the result. If the writer is already closed, it returns ErrClosed.
+// receives the result.
+//
+// It returns ErrClosed if the writer is closed, and ErrQueueFull if the task
+// queue is full. The latter is transient back-pressure: the task was not
+// executed and may be retried once the queue drains.
 func (bw *BufferWriter) do(task TaskFunc) (chan TaskResult, error) {
 	if bw.closed.Load() {
 		return nil, ErrClosed
@@ -224,9 +242,19 @@ func (bw *BufferWriter) do(task TaskFunc) (chan TaskResult, error) {
 	case <-bw.done:
 		return nil, ErrClosed
 	default:
-		// bw.buffer is owned by the flush goroutine; see Flush().
-		slog.Warn("task blocked")
-		return nil, ErrClosed
+		// The task queue is full: the flush goroutine is behind, e.g. blocked
+		// on a slow statement or on the SQLite write lock. This is
+		// back-pressure, not a closed writer — report it as such so the
+		// caller can retry instead of treating the write as lost for good.
+		//
+		// len/cap on a channel are safe to read while the flush goroutine
+		// sends and receives on it, so the occupancy can be reported without
+		// a data race. bw.buffer, in contrast, is owned by the flush
+		// goroutine; see Flush().
+		slog.Warn("task blocked",
+			slog.Int("queued", len(bw.tasks)),
+			slog.Int("capacity", cap(bw.tasks)))
+		return nil, ErrQueueFull
 	}
 }
 
