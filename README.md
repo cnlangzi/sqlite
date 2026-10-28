@@ -274,8 +274,8 @@ The package uses `log/slog` for structured logging at key points in the writer/b
 | Debug | `commit triggered` | `trigger`, `buffer` | Commit initiated (trigger: size/interval/manual/close) |
 | Info | `committed` | `trigger`, `count`, `elapsed` | Successful commit with duration |
 | Error | `commit failed` | `trigger`, `buffer`, `err` | Commit failure |
-| Debug | `flush requested` | `buffer` | Manual Flush() called |
-| Warn | `task blocked` | `buffer` | Channel full, task rejected |
+| Debug | `flush requested` | - | Manual Flush() called |
+| Warn | `task blocked` | - | Channel full, task rejected |
 | Info | `close signal received` | - | Close signal received |
 | Info | `drained on close` | `remaining_buffer` | Final commit on close |
 | Debug | `tx committed` | `count` | Buffered Tx committed successfully |
