@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -341,6 +342,108 @@ func (t *blockingTask) Exec(_ *BufferWriter) TaskResult {
 func (t *blockingTask) Notify() chan TaskResult { return t.notify }
 
 func (t *blockingTask) Action() Action { return ActionExec }
+
+// TestWriter_AwaitAfterShutdownReturnsErrClosed verifies that a caller
+// waiting for a task that the writer never executed is not left blocking
+// forever: the writer reports ErrClosed instead.
+func TestWriter_AwaitAfterShutdownReturnsErrClosed(t *testing.T) {
+	bw := &BufferWriter{
+		DB:     nil,
+		cfg:    BufferConfig{Size: 100, FlushInterval: 100 * time.Second},
+		tasks:  make(chan TaskFunc, 1),
+		close:  make(chan struct{}, 1),
+		done:   make(chan struct{}),
+		buffer: 0,
+	}
+
+	// The flush goroutine has exited and the task was never executed.
+	close(bw.done)
+
+	ch := make(chan TaskResult, 1)
+
+	done := make(chan TaskResult, 1)
+	go func() { done <- bw.await(ch) }()
+
+	select {
+	case result := <-done:
+		assert.ErrorIs(t, result.Error, ErrClosed)
+	case <-time.After(5 * time.Second):
+		t.Fatal("await blocked forever after the writer shut down")
+	}
+}
+
+// TestWriter_AwaitPrefersDeliveredResult verifies that a task that did run
+// keeps its result even when the writer shut down afterwards: the caller
+// must not be told a statement failed when it actually succeeded.
+func TestWriter_AwaitPrefersDeliveredResult(t *testing.T) {
+	bw := &BufferWriter{
+		DB:     nil,
+		cfg:    BufferConfig{Size: 100, FlushInterval: 100 * time.Second},
+		tasks:  make(chan TaskFunc, 1),
+		close:  make(chan struct{}, 1),
+		done:   make(chan struct{}),
+		buffer: 0,
+	}
+
+	ch := make(chan TaskResult, 1)
+	ch <- TaskResult{Result: "ok"}
+	close(bw.done)
+
+	result := bw.await(ch)
+	require.NoError(t, result.Error)
+	assert.Equal(t, "ok", result.Result)
+}
+
+// TestWriter_ExecConcurrentWithCloseDoesNotHang verifies that a write racing
+// with Close() never blocks forever. The flush goroutine drains the task
+// queue and exits while a caller may still be submitting; a task accepted in
+// that window would never be executed nor notified, leaving the caller
+// blocked on the result channel.
+func TestWriter_ExecConcurrentWithCloseDoesNotHang(t *testing.T) {
+	db, cleanup := newTestDB(t)
+	defer cleanup()
+
+	var id atomic.Int64
+
+	for round := 0; round < 25; round++ {
+		bw := NewWriter(db, BufferConfig{
+			Size:          100,
+			FlushInterval: 10 * time.Millisecond,
+		})
+
+		var wg sync.WaitGroup
+		stop := make(chan struct{})
+		for i := 0; i < 4; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					_, _ = bw.Exec("INSERT INTO users (id, name) VALUES (?, 'x')", id.Add(1))
+				}
+			}()
+		}
+
+		// Give the writers a moment to start submitting, then close the
+		// writer underneath them.
+		time.Sleep(time.Millisecond)
+		require.NoError(t, bw.Close())
+		close(stop)
+
+		finished := make(chan struct{})
+		go func() { wg.Wait(); close(finished) }()
+
+		select {
+		case <-finished:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("round %d: writers did not return after Close", round)
+		}
+	}
+}
 
 func TestWriter_DirectExec_Concurrent(t *testing.T) {
 	db, cleanup := newTestDB(t)

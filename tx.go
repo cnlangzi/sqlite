@@ -29,7 +29,7 @@ func (btx *Tx) Exec(query string, args ...any) (sql.Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	result := <-ch
+	result := btx.w.await(ch)
 	if result.Error != nil {
 		return nil, result.Error
 	}
@@ -49,7 +49,7 @@ func (btx *Tx) Commit() error {
 	if err != nil {
 		return err
 	}
-	result := <-ch
+	result := btx.w.await(ch)
 	if result.Error != nil {
 		slog.Debug("tx commit failed", slog.String("err", result.Error.Error()))
 		return result.Error
@@ -76,7 +76,7 @@ func (btx *Tx) Rollback() error {
 	if err != nil {
 		return err
 	}
-	result := <-ch
+	result := btx.w.await(ch)
 
 	slog.Debug("tx rolled back", slog.Int("count", btx.count))
 	return result.Error

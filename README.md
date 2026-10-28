@@ -156,9 +156,14 @@ func (w *Writer) Close() error
 | `sqlite.ErrQueueFull` | The writer's task queue is full; the task was **not** executed | Transient — retry once the queue drains |
 
 `ErrQueueFull` is back-pressure: the flush goroutine is behind, for example
-because it is blocked on a slow statement or on the SQLite write lock. The two
-sentinels are never conflated, so a caller can always tell "retry this write"
-apart from "the writer is dead".
+because it is blocked on a slow statement or on the SQLite write lock. The
+rejected task did not run, so retrying it is safe — but only while the writer
+is alive: a writer that is shutting down reports `ErrClosed`, which is
+terminal.
+
+The two sentinels describe different conditions and are never returned for the
+same situation, so a caller can always tell "retry this write" apart from "the
+writer is dead".
 
 ### Tx (Buffered Transaction)
 
